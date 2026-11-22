@@ -22,10 +22,17 @@ this repository.
 
 Date: 2026-11-22
 
-Decision: <describe the document, units and identifiers>
+Decision: the document stores a title, one expression, a list of
+`(name, value)` variables and a bounded list of evaluated expressions. Schema
+version stays at 1 for this first domain revision.
 
-Alternatives:
+Alternatives: separate documents per worksheet; storing only the expression
+history; storing matrices in the document.
 
-Reasons:
+Reasons: one expression plus its variables is enough to reproduce the current
+calculation and plot after reopening a project. Matrices are entered in a
+scratch panel and are intentionally not persisted yet.
 
-Consequences:
+Consequences: adding persisted worksheets or matrices requires a schema bump
+and a migration test. The plot always binds `x` to the sampled abscissa,
+overriding any document variable named `x`.

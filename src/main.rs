@@ -1,9 +1,8 @@
-//! CraftKit reference application entry point.
+//! MathCraft entry point: CLI, window options and eframe startup.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod document;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};
@@ -23,7 +22,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "mathcraft",
-                    "CraftKit demo — notes application and reference implementation"
+                    "MathCraft — scientific calculator, matrices and 2D plots"
                 )
             );
             return Ok(());
@@ -36,7 +35,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
     };
 
     run_native(WindowOptions::new("MathCraft"), move |context| {
-        let app = app::DemoApp::new(context, options);
+        let app = app::MathApp::new(context, options);
         Ok(Box::new(app) as Box<dyn craftkit_ui::eframe::App>)
     })
 }
