@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "mathcraft",
+  "name": "MathCraft",
+  "tagline": "Scientific calculator, matrices and 2D plots",
+  "repo": "emilio-n8n/mathcraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.mathcraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/mathcraft",
+  "color": "#8b5cf6",
+  "icon": "mathcraft-128.png"
+}
