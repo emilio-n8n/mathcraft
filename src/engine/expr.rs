@@ -4,14 +4,17 @@
 //!
 //! ```text
 //! expr    := term (('+' | '-') term)*
-//! term    := unary (('*' | '/') unary)*
+//! term    := unary (('*' | '/' | implicit) unary)*
 //! unary   := ('+' | '-') unary | power
 //! power   := primary ('^' unary)?
 //! primary := number | ident [ '(' args ')' ] | '(' expr ')'
 //! ```
 //!
 //! Power is right-associative and binds tighter than unary minus, so `-2^2`
-//! evaluates to `-4` while `2^-2` evaluates to `0.25`.
+//! evaluates to `-4` while `2^-2` evaluates to `0.25`. Adjacent operands imply
+//! multiplication (`2x`, `2(x+1)`, `pi(x+1)`), except when the identifier is a
+//! known function name followed by `(`. Scientific notation (`1.5e-3`) is
+//! accepted in numeric literals; a bare `e` remains Euler's constant.
 
 use std::fmt;
 
@@ -47,6 +50,20 @@ pub enum TokenKind {
     RParen,
     /// `,`
     Comma,
+}
+
+/// Function names understood by the evaluator, also used for syntax help.
+pub const FUNCTION_NAMES: &[&str] = &[
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sqrt", "abs", "ln", "log", "exp", "pow",
+    "round", "floor", "ceil", "trunc", "sign", "min", "max", "sum", "mean",
+];
+
+/// True when an identifier followed by `(` is a function call rather than an
+/// implicit multiplication.
+#[must_use]
+pub fn is_function_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    FUNCTION_NAMES.contains(&lower.as_str())
 }
 
 impl TokenKind {
@@ -116,9 +133,11 @@ impl fmt::Display for MathError {
             Self::UnknownVariable { name, pos } => {
                 write!(formatter, "unknown variable '{name}' (position {pos})")
             }
-            Self::UnknownFunction { name, pos } => {
-                write!(formatter, "unknown function '{name}' (position {pos})")
-            }
+            Self::UnknownFunction { name, pos } => write!(
+                formatter,
+                "unknown function '{name}' (position {pos}); available: {}",
+                FUNCTION_NAMES.join(", ")
+            ),
             Self::Evaluation { message } => write!(formatter, "{message}"),
         }
     }
@@ -228,10 +247,28 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, MathError> {
                     }
                     end += 1;
                 }
+                // Scientific notation is only consumed when the exponent has at
+                // least one digit: `2e` stays `2 * e` (the Euler constant).
+                if end < bytes.len() && matches!(bytes[end], b'e' | b'E') {
+                    let mut probe = end + 1;
+                    if probe < bytes.len() && matches!(bytes[probe], b'+' | b'-') {
+                        probe += 1;
+                    }
+                    let digits = probe;
+                    while probe < bytes.len() && bytes[probe].is_ascii_digit() {
+                        probe += 1;
+                    }
+                    if probe > digits {
+                        end = probe;
+                    }
+                }
                 let text = &input[index..end];
                 let value = text
                     .parse::<f64>()
                     .map_err(|_| MathError::syntax("invalid number", Some(pos)))?;
+                if !value.is_finite() {
+                    return Err(MathError::syntax("number is out of range", Some(pos)));
+                }
                 index = end;
                 TokenKind::Number(value)
             }
@@ -377,13 +414,21 @@ impl<'a> Parser<'a> {
     fn parse_term(&mut self) -> Result<Expr, MathError> {
         let mut left = self.parse_unary()?;
         loop {
-            let op = match self.peek().map(|token| &token.kind) {
-                Some(TokenKind::Star) => BinaryOp::Mul,
-                Some(TokenKind::Slash) => BinaryOp::Div,
+            // Adjacent primary tokens imply multiplication: 2x, 2(x+1),
+            // (x+1)(x-1), 3pi. Function calls are already resolved in
+            // `parse_primary`, so a following `(` here is a product.
+            let (op, explicit) = match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::Star) => (BinaryOp::Mul, true),
+                Some(TokenKind::Slash) => (BinaryOp::Div, true),
+                Some(TokenKind::Number(_) | TokenKind::Ident(_) | TokenKind::LParen) => {
+                    (BinaryOp::Mul, false)
+                }
                 _ => break,
             };
             let pos = left.pos;
-            self.advance();
+            if explicit {
+                self.advance();
+            }
             let right = self.parse_unary()?;
             left = Expr::new(
                 ExprKind::Binary {
@@ -568,27 +613,53 @@ pub fn eval(expr: &Expr, variables: &[(String, f64)]) -> Result<f64, MathError> 
 }
 
 fn call(name: &str, args: &[f64], pos: usize) -> Result<f64, MathError> {
-    let arity = |expected: usize| {
+    let problem = |message: String| MathError::Syntax {
+        message,
+        pos: Some(pos),
+    };
+    let exact = |expected: usize| {
         if args.len() == expected {
             Ok(())
         } else {
-            Err(MathError::syntax(
-                format!("{name} expects {expected} argument(s), got {}", args.len()),
-                Some(pos),
-            ))
+            Err(problem(format!(
+                "{name} expects {expected} argument(s), got {}",
+                args.len()
+            )))
         }
     };
     let one = || {
-        arity(1)?;
+        exact(1)?;
         Ok(args[0])
+    };
+    let two = || {
+        exact(2)?;
+        Ok((args[0], args[1]))
+    };
+    let nonempty = || {
+        if args.is_empty() {
+            Err(problem(format!("{name} expects at least one argument")))
+        } else {
+            Ok(())
+        }
     };
     let positive = |value: f64, function: &str| {
         if value > 0.0 {
             Ok(value)
         } else {
-            Err(MathError::Evaluation {
-                message: format!("{function} requires a positive argument"),
-            })
+            Err(problem(format!(
+                "{function} requires a positive argument, got {}",
+                format_value(value)
+            )))
+        }
+    };
+    let unit_interval = |value: f64, function: &str| {
+        if (-1.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(problem(format!(
+                "{function} requires an argument between -1 and 1, got {}",
+                format_value(value)
+            )))
         }
     };
 
@@ -596,12 +667,20 @@ fn call(name: &str, args: &[f64], pos: usize) -> Result<f64, MathError> {
         "sin" => Ok(one()?.sin()),
         "cos" => Ok(one()?.cos()),
         "tan" => Ok(one()?.tan()),
+        "asin" => Ok(unit_interval(one()?, "asin")?.asin()),
+        "acos" => Ok(unit_interval(one()?, "acos")?.acos()),
+        "atan" => Ok(one()?.atan()),
+        "atan2" => {
+            let (y, x) = two()?;
+            Ok(y.atan2(x))
+        }
         "sqrt" => {
             let value = one()?;
             if value < 0.0 {
-                Err(MathError::Evaluation {
-                    message: "sqrt requires a non-negative argument".to_owned(),
-                })
+                Err(problem(format!(
+                    "sqrt requires a non-negative argument, got {}",
+                    format_value(value)
+                )))
             } else {
                 Ok(value.sqrt())
             }
@@ -615,18 +694,58 @@ fn call(name: &str, args: &[f64], pos: usize) -> Result<f64, MathError> {
                 let value = positive(args[0], "log")?;
                 let base = positive(args[1], "log base")?;
                 if (base - 1.0).abs() < f64::EPSILON {
-                    Err(MathError::Evaluation {
-                        message: "log base must not be 1".to_owned(),
-                    })
+                    Err(problem("log base must not be 1".to_owned()))
                 } else {
                     Ok(value.log(base))
                 }
             }
-            other => Err(MathError::syntax(
-                format!("log expects 1 or 2 arguments, got {other}"),
-                Some(pos),
-            )),
+            other => Err(problem(format!(
+                "log expects 1 or 2 arguments, got {other}"
+            ))),
         },
+        "pow" => {
+            let (base, exponent) = two()?;
+            let value = base.powf(exponent);
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(problem(format!(
+                    "pow is undefined for {} and {}",
+                    format_value(base),
+                    format_value(exponent)
+                )))
+            }
+        }
+        "round" => Ok(one()?.round()),
+        "floor" => Ok(one()?.floor()),
+        "ceil" => Ok(one()?.ceil()),
+        "trunc" => Ok(one()?.trunc()),
+        "sign" => {
+            let value = one()?;
+            Ok(if value > 0.0 {
+                1.0
+            } else if value < 0.0 {
+                -1.0
+            } else {
+                0.0
+            })
+        }
+        "min" => {
+            nonempty()?;
+            Ok(args.iter().copied().fold(f64::INFINITY, f64::min))
+        }
+        "max" => {
+            nonempty()?;
+            Ok(args.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+        }
+        "sum" => {
+            nonempty()?;
+            Ok(args.iter().sum())
+        }
+        "mean" => {
+            nonempty()?;
+            Ok(args.iter().sum::<f64>() / args.len() as f64)
+        }
         _ => Err(MathError::UnknownFunction {
             name: name.to_owned(),
             pos,
@@ -675,12 +794,13 @@ pub fn format_value(value: f64) -> String {
 mod tests {
     use super::*;
 
-    fn number(expression: &str) -> f64 {
-        evaluate(expression, &[]).unwrap_or_else(|error| panic!("{expression}: {error}"))
+    fn close(expression: &str, expected: f64) {
+        close_with(expression, &[], expected);
     }
 
-    fn close(expression: &str, expected: f64) {
-        let actual = number(expression);
+    fn close_with(expression: &str, variables: &[(String, f64)], expected: f64) {
+        let actual =
+            evaluate(expression, variables).unwrap_or_else(|error| panic!("{expression}: {error}"));
         assert!(
             (actual - expected).abs() < 1e-9,
             "{expression}: expected {expected}, got {actual}"
@@ -748,8 +868,53 @@ mod tests {
     }
 
     #[test]
+    fn scientific_notation_and_implicit_multiplication() {
+        let variables = vec![("x".to_owned(), 3.0), ("r".to_owned(), 3.0)];
+        close("1e3", 1000.0);
+        close("2.5e-2", 0.025);
+        close("3E+1", 30.0);
+        close("2e", 2.0 * std::f64::consts::E);
+        close_with("2x", &variables, 6.0);
+        close_with("2(x+1)", &variables, 8.0);
+        close_with("(x+1)(x-1)", &variables, 8.0);
+        close_with("pi r^2", &variables, std::f64::consts::PI * 9.0);
+        close("2sin(pi/2)", 2.0);
+    }
+
+    #[test]
+    fn additional_functions_and_precise_errors() {
+        close("asin(0)", 0.0);
+        close("acos(1)", 0.0);
+        close("atan(1)", std::f64::consts::FRAC_PI_4);
+        close("atan2(1,1)", std::f64::consts::FRAC_PI_4);
+        close("round(2.6)", 3.0);
+        close("floor(-1.2)", -2.0);
+        close("ceil(1.2)", 2.0);
+        close("trunc(-1.9)", -1.0);
+        close("sign(-4)", -1.0);
+        close("min(3,1,2)", 1.0);
+        close("max(3,1,2)", 3.0);
+        close("sum(1,2,3)", 6.0);
+        close("mean(1,2,3,4)", 2.5);
+        close("pow(2,10)", 1024.0);
+
+        let error = evaluate("asin(2)", &[]).unwrap_err().to_string();
+        assert!(error.contains("between -1 and 1"), "{error}");
+        assert!(error.contains("got 2"), "{error}");
+        let error = evaluate("sqrt(-4)", &[]).unwrap_err().to_string();
+        assert!(
+            error.contains("non-negative") && error.contains("-4"),
+            "{error}"
+        );
+        let error = evaluate("min()", &[]).unwrap_err().to_string();
+        assert!(error.contains("at least one argument"), "{error}");
+        let error = evaluate("foo(1)", &[]).unwrap_err().to_string();
+        assert!(error.contains("available:"), "{error}");
+    }
+
+    #[test]
     fn invalid_syntax_is_actionable() {
-        for input in ["2+", "(2+3", "2 3", "sqrt()", "2..3", "1 $ 2"] {
+        for input in ["2+", "(2+3", "2 + * 3", "sqrt()", "2..3", "1 $ 2"] {
             let error = evaluate(input, &[]).unwrap_err();
             assert!(
                 matches!(error, MathError::Syntax { .. }),

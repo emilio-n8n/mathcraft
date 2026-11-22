@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize};
+
 /// Errors produced by matrix construction and arithmetic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixError {
@@ -53,9 +55,69 @@ impl fmt::Display for MatrixError {
 impl std::error::Error for MatrixError {}
 
 /// A rectangular, row-major matrix of `f64` values.
+///
+/// Deserialization validates the shape so a malformed project file cannot
+/// create a matrix that would panic on `cols` or `transpose`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Matrix {
     rows: Vec<Vec<f64>>,
+}
+
+impl Serialize for Matrix {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.rows.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Matrix {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Rows { rows: Vec<Vec<f64>> },
+            Bare(Vec<Vec<f64>>),
+        }
+        let rows = match Stored::deserialize(deserializer)? {
+            Stored::Rows { rows } => rows,
+            Stored::Bare(rows) => rows,
+        };
+        Self::new(rows).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse the text form used by the UI: rows separated by `;` or a newline,
+/// coefficients separated by spaces, commas or tabs.
+///
+/// # Errors
+///
+/// Returns [`MatrixError::InvalidNumber`] for a non-numeric coefficient and
+/// [`MatrixError::Empty`] / [`MatrixError::Ragged`] for invalid shapes.
+pub fn parse_matrix(text: &str) -> Result<Matrix, MatrixError> {
+    let mut rows = Vec::new();
+    for line in text.split([';', '\n']) {
+        let mut row = Vec::new();
+        for token in line.split(|character: char| character.is_whitespace() || character == ',') {
+            if token.is_empty() {
+                continue;
+            }
+            let value = token
+                .parse::<f64>()
+                .map_err(|_| MatrixError::InvalidNumber {
+                    token: token.to_owned(),
+                })?;
+            row.push(value);
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    Matrix::new(rows)
 }
 
 impl Matrix {
@@ -387,9 +449,58 @@ mod tests {
     }
 
     #[test]
+    fn serializes_and_rejects_malformed_project_data() {
+        let matrix = Matrix::from_2x2(1.0, 2.0, 3.0, 4.0);
+        let json = serde_json::to_string(&matrix).unwrap();
+        assert_eq!(json, "[[1.0,2.0],[3.0,4.0]]");
+        let restored: Matrix = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, matrix);
+        assert!(serde_json::from_str::<Matrix>("{\"rows\":[[1.0],[2.0,3.0]]}").is_err());
+        assert!(serde_json::from_str::<Matrix>("{\"rows\":[]}").is_err());
+        assert!(serde_json::from_str::<Matrix>("[]").is_err());
+    }
+
+    #[test]
+    fn parses_ui_text_form() {
+        assert_eq!(
+            parse_matrix("1, 2; 3 4").unwrap(),
+            Matrix::from_2x2(1.0, 2.0, 3.0, 4.0)
+        );
+        assert!(matches!(
+            parse_matrix("1 x; 3 4"),
+            Err(MatrixError::InvalidNumber { .. })
+        ));
+        assert_eq!(parse_matrix(""), Err(MatrixError::Empty));
+    }
+
+    #[test]
     fn scaling_and_display() {
         let matrix = Matrix::from_2x2(1.0, -2.0, 3.5, 4.0);
         assert_eq!(matrix.scale(2.0), Matrix::from_2x2(2.0, -4.0, 7.0, 8.0));
         assert_eq!(matrix.to_string(), "[1 -2]\n[3.5 4]");
+    }
+
+    #[test]
+    fn text_round_trip_and_bad_coefficients() {
+        assert_eq!(
+            parse_matrix("1, 2; 3 4").unwrap(),
+            Matrix::from_2x2(1.0, 2.0, 3.0, 4.0)
+        );
+        assert_eq!(parse_matrix("1 2\n3 4").unwrap().shape(), (2, 2));
+        assert_eq!(parse_matrix(""), Err(MatrixError::Empty));
+        assert!(matches!(
+            parse_matrix("1 x; 3 4"),
+            Err(MatrixError::InvalidNumber { .. })
+        ));
+    }
+
+    #[test]
+    fn serde_round_trip_rejects_ragged_rows() {
+        let matrix = Matrix::from_2x2(1.0, 2.0, 3.0, 4.0);
+        let json = serde_json::to_string(&matrix).unwrap();
+        let restored: Matrix = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, matrix);
+        let ragged = "[[1.0,2.0],[3.0]]";
+        assert!(serde_json::from_str::<Matrix>(ragged).is_err());
     }
 }

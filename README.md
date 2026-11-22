@@ -12,17 +12,25 @@ desktop foundation.
 ## Features
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
-- Expression parser and evaluator: `+ - * / ^`, parentheses, variables,
-  constants `pi` and `e`, and functions `sin cos tan sqrt abs ln log exp`.
+- Notebook with multiple named sheets, each holding several expressions.
+  Cell results and errors are persisted in the project. Cells can reference
+  each other (`A1`, `A2`, case-insensitive); sheets and document variables are
+  also in scope. Circular references are reported explicitly.
+- Expression parser and evaluator: `+ - * / ^`, parentheses, implicit
+  multiplication (`2x`, `2(x+1)`), scientific notation (`1.5e-3`), variables,
+  constants `pi` and `e`, and 22 functions (trigonometry and inverse
+  trigonometry, logarithms, rounding, `min`/`max`/`sum`/`mean`, ...).
   Syntax errors report the offending token and its byte position.
-- Document variables with add/remove editing, plus a bounded history of
+- Named variables with add/remove editing and a bounded, clickable history of
   evaluated expressions.
-- Dense matrix arithmetic: addition, subtraction, multiplication by another
-  matrix or a scalar, transpose and determinant.
-- 2D plot of `y = f(x)` drawn directly on the egui `Painter`: axes, grid,
-  graduations and curve, with no plotting dependency. The variable `x` is
-  sampled over a configurable interval.
-- Versioned JSON project files with atomic saves.
+- Dense matrix arithmetic (addition, subtraction, multiplication, transpose,
+  determinant) with named matrices saved in the project.
+- Interactive 2D plot of `y = f(x)`: drag to pan, scroll to zoom, editable X/Y
+  ranges, several curves at once, imported CSV series. Export to CSV or PNG
+  (the PNG rasteriser draws axes and curves, no plotting dependency).
+- CSV import of `x,y` point series and CSV export of results and variables.
+- Versioned JSON project files (schema 2) with atomic saves and automatic
+  migration of schema 1 notebooks.
 - Bounded undo/redo through the shared document history.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
@@ -57,10 +65,13 @@ Linux windowing development packages are installed by the CI workflow.
 src/main.rs         CLI and window startup
 src/app.rs          UI, menus and lifecycle
 src/lib.rs          UI-free library surface
-src/document.rs     application document model
+src/document.rs     schema 2 document model and migration
 src/engine/expr.rs  tokenizer, parser and evaluator
-src/engine/matrix.rs matrix arithmetic
+src/engine/matrix.rs matrix arithmetic and persistence
+src/engine/sheet.rs worksheet evaluation and cell references
 src/engine/plot.rs  pure plot sampling helpers
+src/engine/csv.rs   CSV import/export helpers
+src/engine/raster.rs PNG raster and plot rendering
 ```
 
 The application depends on pinned CraftKit crates from Git. Keep the tag in
@@ -73,14 +84,18 @@ Projects are JSON envelopes:
 ```json
 {
   "format": "mathcraft",
-  "schema_version": 1,
+  "schema_version": 2,
   "app_version": "0.1.0",
   "document": { }
 }
 ```
 
-The application owns the `document` schema and its migrations. A newer
-`schema_version` is rejected instead of being silently misread.
+The document holds `sheets` (expressions and persisted results), `variables`,
+`active_sheet`, named `matrices`, imported point `series` and `history`. The
+legacy schema 1 `expression` is migrated into the first sheet on open; a newer
+`schema_version` is rejected instead of being silently misread. The launcher
+descriptor `craft-app.json` is independent of the document schema and stays at
+schema 1.
 
 ## Licence
 

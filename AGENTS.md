@@ -20,9 +20,16 @@ export CARGO_TARGET_DIR=/tmp/cargo-target
 ## Architecture
 
 ```text
-src/main.rs       CLI, window options and eframe startup
-src/app.rs        UI, menus, actions and project lifecycle
-src/document.rs   application document model
+src/main.rs         CLI, window options and eframe startup
+src/app.rs          UI, menus, actions and project lifecycle
+src/lib.rs          UI-free library surface
+src/document.rs     schema 2 document model and schema 1 migration
+src/engine/expr.rs  tokenizer, parser and evaluator
+src/engine/matrix.rs matrix arithmetic and defensive JSON decoding
+src/engine/sheet.rs worksheet dependencies and cycle detection
+src/engine/plot.rs  pure sampling helpers
+src/engine/csv.rs   CSV import/export helpers
+src/engine/raster.rs PNG rasteriser for plot export
 ```
 
 CraftKit provides:
@@ -41,7 +48,9 @@ domain logic in the UI event handlers; keep it in testable modules.
   gesture (`begin_gesture` / `current_mut` / `end_gesture`).
 - Long operations run through `JobRunner`; never block `ui()`.
 - Parse external input defensively; no `unwrap` on user files.
-- A schema change bumps `SCHEMA_VERSION` and adds a migration test.
+- A schema change bumps `SCHEMA_VERSION` (currently 2) and adds a migration
+  test. Schema 1 documents are normalised on open; the launcher descriptor has
+  its own schema and must stay at 1.
 - No `unsafe`. Comments and UI wording in English.
 - Fixtures and demo assets must be generated or licence-clear.
 
@@ -50,7 +59,8 @@ domain logic in the UI event handlers; keep it in testable modules.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --locked
+python3 tools/launcher_check.py .
 ```
 
 ## Release

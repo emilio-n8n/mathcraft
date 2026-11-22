@@ -2,15 +2,23 @@
 
 All notable changes to MathCraft are documented here.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-22
+
+### Changed
+
+- Document schema 2: notebooks with multiple sheets, persisted cell results,
+  named matrices and CSV series. Schema 1 files are migrated on open.
 
 ### Added
 
-- Expression tokenizer, recursive-descent parser and evaluator with actionable
-  syntax errors, variables, constants and scientific functions.
-- Matrix addition, subtraction, multiplication, transpose and determinant.
-- 2D `y = f(x)` plot drawn on the egui painter with axes and graduations.
-- Variable editor, evaluation history and JSON round-trip tests.
+- Expression parser with scientific notation, implicit multiplication and 22
+  functions including inverse trigonometry, rounding and basic statistics.
+- Cell-to-cell references with cycle detection and detailed error messages.
+- Interactive plot: drag to pan, scroll to zoom, editable ranges, several
+  curves, CSV import, and CSV/PNG export via a small raster encoder.
+- CSV import/export for point series, results and variables.
+- Examples menu and collapsible syntax help.
+- Tests for migration, parser, matrices, sheets, plot, CSV and undo.
 
 ## [0.1.0] - 2026-11-22
 

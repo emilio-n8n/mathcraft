@@ -1700,6 +1700,7 @@ dependencies = [
  "craftkit-io",
  "craftkit-jobs",
  "craftkit-ui",
+ "png",
  "serde",
  "serde_json",
 ]
