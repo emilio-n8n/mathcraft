@@ -601,127 +601,142 @@ impl MathApp {
             .default_size(260.0)
             .min_size(210.0)
             .show(ui, |ui| {
-                widgets::section_label(ui, "Variables");
-                for (index, (name, value)) in self
-                    .host
-                    .history_mut()
-                    .current_mut()
-                    .variables
-                    .iter_mut()
-                    .enumerate()
-                {
-                    ui.horizontal(|ui| {
-                        let name_response =
-                            ui.add(egui::TextEdit::singleline(name).desired_width(78.0));
-                        let value_response = ui.add(egui::DragValue::new(value).speed(0.1));
-                        variable_focus_gained |=
-                            name_response.gained_focus() || value_response.gained_focus();
-                        variable_focus_lost |=
-                            name_response.lost_focus() || value_response.lost_focus();
-                        if ui.small_button("x").clicked() {
-                            remove_variable = Some(index);
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.new_variable_name)
-                            .hint_text("name")
-                            .desired_width(78.0),
-                    );
-                    ui.add(egui::DragValue::new(&mut self.new_variable_value).speed(0.1));
-                    let enter = response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    if ui.button("Add").clicked() || enter {
-                        add_variable = true;
-                    }
-                });
-                if let Some(index) = remove_variable {
-                    self.host.apply(|document| {
-                        document.variables.remove(index);
-                    });
-                }
-                if add_variable {
-                    let name = self.new_variable_name.trim().to_owned();
-                    if !name.is_empty() {
-                        let value = self.new_variable_value;
-                        self.host.apply(|document| {
-                            if let Some(entry) = document
-                                .variables
-                                .iter_mut()
-                                .find(|(existing, _)| existing == &name)
-                            {
-                                entry.1 = value;
-                            } else {
-                                document.variables.push((name.clone(), value));
-                            }
-                        });
-                        self.new_variable_name.clear();
-                    }
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                widgets::section_label(ui, "Saved matrices");
-                let matrices = self.host.document().matrices.clone();
-                if matrices.is_empty() {
-                    ui.label(RichText::new("No saved matrices").color(theme::FAINT));
-                }
-                for (index, entry) in matrices.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&entry.name).monospace());
-                        ui.label(
-                            RichText::new(format!(
-                                "{}x{}",
-                                entry.matrix.rows(),
-                                entry.matrix.cols()
-                            ))
-                            .color(theme::MUTED),
-                        );
-                        if ui.small_button("load").clicked() {
-                            load_matrix = Some(entry.matrix.to_string());
-                        }
-                        if ui.small_button("x").clicked() {
-                            remove_matrix = Some(index);
-                        }
-                    });
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                widgets::section_label(ui, "Imported series");
-                let series = self.host.document().series.clone();
-                if series.is_empty() {
-                    ui.label(RichText::new("Import CSV to add a curve").color(theme::FAINT));
-                }
-                for (index, entry) in series.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} ({} pts)", entry.name, entry.points.len()))
-                                .monospace(),
-                        );
-                        if ui.small_button("x").clicked() {
-                            remove_series = Some(index);
-                        }
-                    });
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                widgets::section_label(ui, "History");
-                let history = self.host.document().history.clone();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height(180.0)
                     .show(ui, |ui| {
-                        if history.is_empty() {
-                            ui.label(RichText::new("Nothing evaluated yet").color(theme::FAINT));
+                        widgets::section_label(ui, "Variables");
+                        for (index, (name, value)) in self
+                            .host
+                            .history_mut()
+                            .current_mut()
+                            .variables
+                            .iter_mut()
+                            .enumerate()
+                        {
+                            ui.horizontal(|ui| {
+                                let name_response =
+                                    ui.add(egui::TextEdit::singleline(name).desired_width(78.0));
+                                let value_response = ui.add(egui::DragValue::new(value).speed(0.1));
+                                variable_focus_gained |=
+                                    name_response.gained_focus() || value_response.gained_focus();
+                                variable_focus_lost |=
+                                    name_response.lost_focus() || value_response.lost_focus();
+                                if ui.small_button("x").clicked() {
+                                    remove_variable = Some(index);
+                                }
+                            });
                         }
-                        for expression in history.iter().rev() {
-                            if ui.selectable_label(false, expression).clicked() {
-                                picked_history = Some(expression.clone());
+                        ui.horizontal(|ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.new_variable_name)
+                                    .hint_text("name")
+                                    .desired_width(78.0),
+                            );
+                            ui.add(egui::DragValue::new(&mut self.new_variable_value).speed(0.1));
+                            let enter = response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                            if ui.button("Add").clicked() || enter {
+                                add_variable = true;
+                            }
+                        });
+                        if let Some(index) = remove_variable {
+                            self.host.apply(|document| {
+                                document.variables.remove(index);
+                            });
+                        }
+                        if add_variable {
+                            let name = self.new_variable_name.trim().to_owned();
+                            if !name.is_empty() {
+                                let value = self.new_variable_value;
+                                self.host.apply(|document| {
+                                    if let Some(entry) = document
+                                        .variables
+                                        .iter_mut()
+                                        .find(|(existing, _)| existing == &name)
+                                    {
+                                        entry.1 = value;
+                                    } else {
+                                        document.variables.push((name.clone(), value));
+                                    }
+                                });
+                                self.new_variable_name.clear();
                             }
                         }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        widgets::section_label(ui, "Saved matrices");
+                        let matrices = self.host.document().matrices.clone();
+                        if matrices.is_empty() {
+                            ui.label(RichText::new("No saved matrices").color(theme::FAINT));
+                        }
+                        for (index, entry) in matrices.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&entry.name).monospace());
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}x{}",
+                                        entry.matrix.rows(),
+                                        entry.matrix.cols()
+                                    ))
+                                    .color(theme::MUTED),
+                                );
+                                if ui.small_button("load").clicked() {
+                                    load_matrix = Some(entry.matrix.to_string());
+                                }
+                                if ui.small_button("x").clicked() {
+                                    remove_matrix = Some(index);
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        widgets::section_label(ui, "Imported series");
+                        let series = self.host.document().series.clone();
+                        if series.is_empty() {
+                            ui.label(
+                                RichText::new("Import CSV to add a curve").color(theme::FAINT),
+                            );
+                        }
+                        for (index, entry) in series.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} ({} pts)",
+                                        entry.name,
+                                        entry.points.len()
+                                    ))
+                                    .monospace(),
+                                );
+                                if ui.small_button("x").clicked() {
+                                    remove_series = Some(index);
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        widgets::section_label(ui, "History");
+                        let history = self.host.document().history.clone();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                if history.is_empty() {
+                                    ui.label(
+                                        RichText::new("Nothing evaluated yet").color(theme::FAINT),
+                                    );
+                                }
+                                for expression in history.iter().rev() {
+                                    if ui.selectable_label(false, expression).clicked() {
+                                        picked_history = Some(expression.clone());
+                                    }
+                                }
+                            });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        self.csv_panel(ui);
                     });
             });
 
@@ -1157,8 +1172,6 @@ impl MathApp {
             self.plot_panel(ui);
             ui.separator();
             self.matrix_panel(ui);
-            ui.separator();
-            self.csv_panel(ui);
         });
         if evaluate_requested {
             self.evaluate_sheet();
