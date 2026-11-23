@@ -2,6 +2,13 @@
 
 All notable changes to MathCraft are documented here.
 
+## [0.2.1] - 2026-11-23
+
+### Fixed
+
+- Opening a notebook keeps its file path: the title shows the file name and
+  Save writes in place instead of asking for a new destination.
+
 ## [0.2.0] - 2026-11-22
 
 ### Changed
