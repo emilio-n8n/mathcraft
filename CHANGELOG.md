@@ -2,6 +2,13 @@
 
 All notable changes to MathCraft are documented here.
 
+## [0.2.2] - 2026-11-23
+
+### Fixed
+
+- The CSV import panel moved to the scrollable left panel, so it is reachable
+  on windows where the central notebook content extends below the viewport.
+
 ## [0.2.1] - 2026-11-23
 
 ### Fixed
