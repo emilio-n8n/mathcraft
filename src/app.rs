@@ -131,7 +131,7 @@ impl MathApp {
             Ok(mut host) => {
                 let mut document = host.history_mut().current_mut().clone();
                 document.normalize();
-                host.reset(document);
+                host.history_mut().replace(document);
                 self.host = host;
                 self.selected_cell = 0;
                 self.shell.set_status(format!("Opened {}", path.display()));
