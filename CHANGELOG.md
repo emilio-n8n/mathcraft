@@ -2,6 +2,37 @@
 
 All notable changes to MathCraft are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Expressions now support qualified and quoted worksheet references, report
+  line/column diagnostics, reject non-finite results and bound pathological
+  nesting without exhausting the stack.
+- Worksheet evaluation detects self- and cross-sheet cycles, resolves fresh
+  cross-sheet values and reports references to empty cells explicitly.
+- CSV import validates quoting, embedded newlines, finite numbers and column
+  counts instead of silently discarding malformed first rows.
+- Plot CSV export aligns the union of series abscissae and preserves numeric
+  precision; matrix determinants no longer treat small non-zero pivots as zero.
+- PNG line rendering clips extreme coordinates before rasterisation, and plot
+  pan/zoom handles invalid or overflowing ranges safely.
+- Saving refreshes all worksheet results, opening recomputes stale outcomes,
+  and schema 2 legacy mirrors no longer create duplicate cells during migrate.
+- Editing gestures snapshot before the first keystroke; consecutive duplicate
+  history entries are suppressed.
+
+### Added
+
+- Multi-column CSV import (`x,y,z,...`) creates one named series per Y column.
+- PNG exports include curve legends and readable axis graduations.
+- Matrix addition and subtraction, multiline matrix input, and loading saved
+  matrices into either operand.
+- Worksheet tabs scroll, names can be edited with duplicate checks, and
+  deleting a sheet now selects the correct neighbour.
+- Defensive finite-number validation for persisted variables, cell results,
+  matrices and imported series.
+
 ## [0.2.2] - 2026-11-23
 
 ### Fixed

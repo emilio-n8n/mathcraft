@@ -15,6 +15,11 @@
 //! multiplication (`2x`, `2(x+1)`, `pi(x+1)`), except when the identifier is a
 //! known function name followed by `(`. Scientific notation (`1.5e-3`) is
 //! accepted in numeric literals; a bare `e` remains Euler's constant.
+//!
+//! Worksheet references may be qualified (`Plot.A1`). Sheet names containing
+//! spaces or punctuation can be single- or double-quoted (`'My Sheet'.A1`).
+//! Token and nesting limits keep malformed external input from exhausting the
+//! process stack.
 
 use std::fmt;
 
@@ -32,8 +37,10 @@ pub struct Token {
 pub enum TokenKind {
     /// Numeric literal, for example `2` or `3.5`.
     Number(f64),
-    /// Variable, function or constant name.
+    /// Variable, function, constant or qualified worksheet reference.
     Ident(String),
+    /// A quoted sheet or variable name containing punctuation.
+    QuotedIdentifier(String),
     /// `+`
     Plus,
     /// `-`
@@ -52,6 +59,13 @@ pub enum TokenKind {
     Comma,
 }
 
+/// Maximum number of tokens accepted in one expression.
+pub const MAX_TOKENS: usize = 1024;
+/// Maximum recursive nesting accepted by the parser.
+pub const MAX_PARSE_DEPTH: usize = 256;
+/// Maximum evaluation depth, covering every token in a bounded expression.
+pub const MAX_EVAL_DEPTH: usize = MAX_TOKENS + 1;
+
 /// Function names understood by the evaluator, also used for syntax help.
 pub const FUNCTION_NAMES: &[&str] = &[
     "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sqrt", "abs", "ln", "log", "exp", "pow",
@@ -66,11 +80,22 @@ pub fn is_function_name(name: &str) -> bool {
     FUNCTION_NAMES.contains(&lower.as_str())
 }
 
+/// Whether `name` is one unquoted identifier accepted by the tokenizer.
+///
+/// This is useful when validating names entered through the UI; quoted names
+/// remain available for worksheet references in expressions.
+#[must_use]
+pub fn is_identifier(name: &str) -> bool {
+    matches!(tokenize(name), Ok(tokens) if tokens.len() == 1 && matches!(&tokens[0].kind, TokenKind::Ident(_)))
+}
+
 impl TokenKind {
     fn description(&self) -> String {
         match self {
             Self::Number(value) => format!("number {value}"),
-            Self::Ident(name) => format!("identifier '{name}'"),
+            Self::Ident(name) | Self::QuotedIdentifier(name) => {
+                format!("identifier '{name}'")
+            }
             Self::Plus => "'+'".to_owned(),
             Self::Minus => "'-'".to_owned(),
             Self::Star => "'*'".to_owned(),
@@ -120,6 +145,66 @@ impl MathError {
             message: message.into(),
             pos,
         }
+    }
+
+    /// Byte offset associated with this error, when available.
+    #[must_use]
+    pub fn position(&self) -> Option<usize> {
+        match self {
+            Self::Syntax { pos, .. } => *pos,
+            Self::UnknownVariable { pos, .. } | Self::UnknownFunction { pos, .. } => Some(*pos),
+            Self::Evaluation { .. } => None,
+        }
+    }
+
+    /// Format an error with a one-based line, column and source excerpt.
+    ///
+    /// The caret uses Unicode character columns while the regular [`Display`]
+    /// implementation keeps reporting byte offsets for machine-readable use.
+    #[must_use]
+    pub fn diagnostic(&self, source: &str) -> String {
+        let message = match self {
+            Self::Syntax { message, .. } => message.clone(),
+            Self::UnknownVariable { name, .. } => format!("unknown variable '{name}'"),
+            Self::UnknownFunction { name, .. } => format!(
+                "unknown function '{name}'; available: {}",
+                FUNCTION_NAMES.join(", ")
+            ),
+            Self::Evaluation { message } => message.clone(),
+        };
+        let Some(pos) = self.position() else {
+            return message;
+        };
+        let pos = pos.min(source.len());
+        // Publicly constructible expressions can carry a non-boundary offset.
+        let pos = source.floor_char_boundary(pos);
+        let before = &source[..pos];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+        let column = before[line_start..].chars().count() + 1;
+        let line_end = source[pos..]
+            .find('\n')
+            .map_or(source.len(), |offset| pos + offset);
+        let line_text = &source[line_start..line_end];
+        let line_chars = line_text.chars().count();
+        let excerpt_start = column.saturating_sub(61).min(line_chars);
+        let excerpt_end = (excerpt_start + 121).min(line_chars);
+        let excerpt = line_text
+            .chars()
+            .skip(excerpt_start)
+            .take(excerpt_end - excerpt_start)
+            .collect::<String>();
+        let caret_offset = column - 1 - excerpt_start;
+        let gutter = line.to_string().len();
+        format!(
+            "{message}\n  --> line {line}, column {column}\n{:gutter$} | {}{}{}\n{:gutter$} | {}^",
+            "",
+            if excerpt_start > 0 { "…" } else { "" },
+            excerpt,
+            if excerpt_end < line_chars { "…" } else { "" },
+            "",
+            " ".repeat(caret_offset)
+        )
     }
 }
 
@@ -274,14 +359,73 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, MathError> {
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let mut end = index + 1;
-                while end < bytes.len()
-                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-                {
-                    end += 1;
+                while end < bytes.len() {
+                    if bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'_'
+                        || (bytes[end] == b'.'
+                            && end + 1 < bytes.len()
+                            && (bytes[end + 1].is_ascii_alphabetic() || bytes[end + 1] == b'_'))
+                    {
+                        end += 1;
+                    } else {
+                        break;
+                    }
                 }
                 let name = input[index..end].to_owned();
                 index = end;
                 TokenKind::Ident(name)
+            }
+            b'\'' | b'"' => {
+                let quote = byte;
+                let mut end = index + 1;
+                let mut name = String::new();
+                let mut closed = false;
+                while end < bytes.len() {
+                    let character = input[end..].chars().next().unwrap_or('\u{fffd}');
+                    let width = character.len_utf8();
+                    if character == quote as char {
+                        if bytes.get(end + width) == Some(&quote) {
+                            name.push(character);
+                            end += width * 2;
+                            continue;
+                        }
+                        end += width;
+                        closed = true;
+                        break;
+                    }
+                    name.push(character);
+                    end += width;
+                }
+                if !closed {
+                    return Err(MathError::syntax(
+                        "unterminated quoted identifier",
+                        Some(pos),
+                    ));
+                }
+                let qualified = if bytes.get(end) == Some(&b'.')
+                    && bytes
+                        .get(end + 1)
+                        .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+                {
+                    let mut suffix_end = end + 1;
+                    while suffix_end < bytes.len()
+                        && (bytes[suffix_end].is_ascii_alphanumeric() || bytes[suffix_end] == b'_')
+                    {
+                        suffix_end += 1;
+                    }
+                    name.push('.');
+                    name.push_str(&input[end + 1..suffix_end]);
+                    end = suffix_end;
+                    true
+                } else {
+                    false
+                };
+                index = end;
+                if qualified {
+                    TokenKind::Ident(name)
+                } else {
+                    TokenKind::QuotedIdentifier(name)
+                }
             }
             b'+' => {
                 index += 1;
@@ -323,6 +467,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, MathError> {
                 ));
             }
         };
+        if tokens.len() >= MAX_TOKENS {
+            return Err(MathError::syntax(
+                format!("expression is too complex (maximum {MAX_TOKENS} tokens)"),
+                Some(pos),
+            ));
+        }
         tokens.push(Token { kind, pos });
     }
     Ok(tokens)
@@ -340,6 +490,7 @@ pub fn parse(input: &str) -> Result<Expr, MathError> {
         tokens: &tokens,
         index: 0,
         source_len: input.len(),
+        depth: 0,
     };
     let expr = parser.parse_expr()?;
     if let Some(token) = parser.peek() {
@@ -355,6 +506,7 @@ struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
     source_len: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -420,9 +572,12 @@ impl<'a> Parser<'a> {
             let (op, explicit) = match self.peek().map(|token| &token.kind) {
                 Some(TokenKind::Star) => (BinaryOp::Mul, true),
                 Some(TokenKind::Slash) => (BinaryOp::Div, true),
-                Some(TokenKind::Number(_) | TokenKind::Ident(_) | TokenKind::LParen) => {
-                    (BinaryOp::Mul, false)
-                }
+                Some(
+                    TokenKind::Number(_)
+                    | TokenKind::Ident(_)
+                    | TokenKind::QuotedIdentifier(_)
+                    | TokenKind::LParen,
+                ) => (BinaryOp::Mul, false),
                 _ => break,
             };
             let pos = left.pos;
@@ -443,6 +598,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, MathError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            let pos = self.peek().map_or(self.source_len, |token| token.pos);
+            return Err(MathError::syntax(
+                "expression nesting is too deep",
+                Some(pos),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_unary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, MathError> {
         let op = match self.peek().map(|token| &token.kind) {
             Some(TokenKind::Plus) => Some(UnaryOp::Plus),
             Some(TokenKind::Minus) => Some(UnaryOp::Minus),
@@ -498,6 +667,9 @@ impl<'a> Parser<'a> {
                 let (name, pos) = (name.clone(), *pos);
                 self.advance();
                 if self.at(&TokenKind::LParen) {
+                    if !is_function_name(&name) {
+                        return Err(MathError::UnknownFunction { name, pos });
+                    }
                     self.advance();
                     let mut args = Vec::new();
                     if self.at(&TokenKind::RParen) {
@@ -524,6 +696,14 @@ impl<'a> Parser<'a> {
                         _ => Ok(Expr::new(ExprKind::Variable(name), pos)),
                     }
                 }
+            }
+            Some(Token {
+                kind: TokenKind::QuotedIdentifier(name),
+                pos,
+            }) => {
+                let (name, pos) = (name.clone(), *pos);
+                self.advance();
+                Ok(Expr::new(ExprKind::Variable(name), pos))
             }
             Some(Token {
                 kind: TokenKind::LParen,
@@ -556,6 +736,30 @@ impl<'a> Parser<'a> {
 /// Returns an error for unknown names, invalid arity, division by zero and
 /// out-of-domain function arguments.
 pub fn eval(expr: &Expr, variables: &[(String, f64)]) -> Result<f64, MathError> {
+    eval_node(expr, variables, 0)
+}
+
+fn eval_node(expr: &Expr, variables: &[(String, f64)], depth: usize) -> Result<f64, MathError> {
+    if depth >= MAX_EVAL_DEPTH {
+        return Err(MathError::Evaluation {
+            message: "expression is too deeply nested to evaluate".to_owned(),
+        });
+    }
+    let value = eval_node_inner(expr, variables, depth)?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(MathError::Evaluation {
+            message: "non-finite result".to_owned(),
+        })
+    }
+}
+
+fn eval_node_inner(
+    expr: &Expr,
+    variables: &[(String, f64)],
+    depth: usize,
+) -> Result<f64, MathError> {
     match &expr.kind {
         ExprKind::Number(value) => Ok(*value),
         ExprKind::Variable(name) => variables
@@ -568,15 +772,15 @@ pub fn eval(expr: &Expr, variables: &[(String, f64)]) -> Result<f64, MathError> 
                 pos: expr.pos,
             }),
         ExprKind::Unary { op, value } => {
-            let value = eval(value, variables)?;
+            let value = eval_node(value, variables, depth + 1)?;
             match op {
                 UnaryOp::Plus => Ok(value),
                 UnaryOp::Minus => Ok(-value),
             }
         }
         ExprKind::Binary { op, left, right } => {
-            let left = eval(left, variables)?;
-            let right = eval(right, variables)?;
+            let left = eval_node(left, variables, depth + 1)?;
+            let right = eval_node(right, variables, depth + 1)?;
             match op {
                 BinaryOp::Add => Ok(left + right),
                 BinaryOp::Sub => Ok(left - right),
@@ -605,7 +809,7 @@ pub fn eval(expr: &Expr, variables: &[(String, f64)]) -> Result<f64, MathError> 
         ExprKind::Call { name, args } => {
             let values = args
                 .iter()
-                .map(|arg| eval(arg, variables))
+                .map(|arg| eval_node(arg, variables, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             call(name, &values, expr.pos)
         }
@@ -781,6 +985,15 @@ pub fn format_value(value: f64) -> String {
     if value.fract() == 0.0 && value.abs() < 1e15 {
         return format!("{value:.0}");
     }
+    if value.abs() < 1e-9 || value.abs() >= 1e15 {
+        let text = format!("{value:.10e}");
+        let Some((mantissa, exponent)) = text.split_once('e') else {
+            return text;
+        };
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        let exponent = exponent.parse::<i32>().unwrap_or(0);
+        return format!("{mantissa}e{exponent}");
+    }
     let text = format!("{value:.10}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() {
@@ -951,5 +1164,68 @@ mod tests {
         assert_eq!(format_value(2.0), "2");
         assert_eq!(format_value(0.1 + 0.2), "0.3");
         assert_eq!(format_value(0.0), "0");
+        assert_eq!(format_value(1.25e-12), "1.25e-12");
+        assert_eq!(format_value(1.0e20), "1e20");
+    }
+
+    #[test]
+    fn qualified_and_quoted_sheet_names_tokenize_as_variables() {
+        let variables = vec![
+            ("Plot.A1".to_owned(), 6.0),
+            ("My Sheet.A1".to_owned(), 8.0),
+            ("My Sheet".to_owned(), 10.0),
+        ];
+        close_with("Plot.A1 + 1", &variables, 7.0);
+        close_with("'My Sheet'.A1 * 2", &variables, 16.0);
+        close_with("\"My Sheet\" + 1", &variables, 11.0);
+        close_with("'O''Brien'.A1", &[("O'Brien.A1".to_owned(), 4.0)], 4.0);
+        assert!(evaluate("'unterminated", &[]).is_err());
+    }
+
+    #[test]
+    fn diagnostics_include_line_column_and_a_caret() {
+        let error = evaluate("x + sqrt(-1)", &[("x".to_owned(), 1.0)]).unwrap_err();
+        let diagnostic = error.diagnostic("x + sqrt(-1)");
+        assert!(diagnostic.contains("line 1, column 5"), "{diagnostic}");
+        assert!(diagnostic.contains("sqrt(-1)"));
+        assert!(diagnostic.contains('^'));
+
+        let error = evaluate("'é' + @", &[]).unwrap_err();
+        let diagnostic = error.diagnostic("'é' + @");
+        assert!(diagnostic.contains("column 7"), "{diagnostic}");
+
+        let error = evaluate("1+\n@", &[]).unwrap_err();
+        let diagnostic = error.diagnostic("1+\n@");
+        assert!(diagnostic.contains("line 2, column 1"), "{diagnostic}");
+    }
+
+    #[test]
+    fn malformed_scientific_notation_and_overflow_are_errors() {
+        for input in ["1e+", "1e-", "1e9999", ".", "1.2.3"] {
+            assert!(evaluate(input, &[]).is_err(), "{input}");
+        }
+        close("1.5E-3", 0.0015);
+        close(".5 + 5.", 5.5);
+        close_with("1e-3x", &[("x".to_owned(), 2.0)], 0.002);
+    }
+
+    #[test]
+    fn external_input_cannot_exhaust_the_parser_or_evaluator_stack() {
+        let nested = format!("{}1{}", "(".repeat(300), ")".repeat(300));
+        assert!(evaluate(&nested, &[]).is_err());
+        let signs = "-".repeat(300) + "1";
+        assert!(evaluate(&signs, &[]).is_err());
+        let long = vec!["1"; MAX_TOKENS + 1].join("+");
+        assert!(evaluate(&long, &[]).is_err());
+        let bounded = vec!["1"; 300].join("+");
+        close(&bounded, 300.0);
+    }
+
+    #[test]
+    fn non_finite_inputs_and_results_are_rejected() {
+        assert!(evaluate("x", &[("x".to_owned(), f64::NAN)]).is_err());
+        assert!(evaluate("min(1,x)", &[("x".to_owned(), f64::NAN)]).is_err());
+        assert!(evaluate("exp(10000)", &[]).is_err());
+        assert!(evaluate("1e308*1e308", &[]).is_err());
     }
 }

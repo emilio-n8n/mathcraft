@@ -14,21 +14,27 @@ desktop foundation.
 - Native Rust desktop UI (egui/eframe), no web runtime.
 - Notebook with multiple named sheets, each holding several expressions.
   Cell results and errors are persisted in the project. Cells can reference
-  each other (`A1`, `A2`, case-insensitive); sheets and document variables are
-  also in scope. Circular references are reported explicitly.
+  each other (`A1`, `A2`, case-insensitive), another sheet (`Plot.A1`) or a
+  quoted sheet name (`'My Sheet'.A1`). Cross-sheet values are recomputed before
+  evaluation, saving and export; self- and cross-sheet circular references are
+  reported explicitly. Sheet names can be edited; update qualified references
+  manually after a rename.
 - Expression parser and evaluator: `+ - * / ^`, parentheses, implicit
   multiplication (`2x`, `2(x+1)`), scientific notation (`1.5e-3`), variables,
   constants `pi` and `e`, and 22 functions (trigonometry and inverse
   trigonometry, logarithms, rounding, `min`/`max`/`sum`/`mean`, ...).
-  Syntax errors report the offending token and its byte position.
+  Syntax errors include a source excerpt with a one-based line and column.
 - Named variables with add/remove editing and a bounded, clickable history of
   evaluated expressions.
 - Dense matrix arithmetic (addition, subtraction, multiplication, transpose,
-  determinant) with named matrices saved in the project.
-- Interactive 2D plot of `y = f(x)`: drag to pan, scroll to zoom, editable X/Y
-  ranges, several curves at once, imported CSV series. Export to CSV or PNG
-  (the PNG rasteriser draws axes and curves, no plotting dependency).
-- CSV import of `x,y` point series and CSV export of results and variables.
+  determinant) with named matrices saved in the project and loadable into
+  either operand.
+- Interactive 2D plot of `y = f(x)`: drag to pan, pointer-anchored scroll zoom,
+  editable X/Y ranges, several curves at once, imported CSV series. Export to
+  CSV or PNG; PNGs include legends and labelled graduations without a plotting
+  dependency.
+- CSV import of `x,y,z,...` point series (one series per Y column), including
+  quoted and multiline headers, plus CSV export of results and variables.
 - Versioned JSON project files (schema 2) with atomic saves and automatic
   migration of schema 1 notebooks.
 - Bounded undo/redo through the shared document history.
@@ -92,10 +98,12 @@ Projects are JSON envelopes:
 
 The document holds `sheets` (expressions and persisted results), `variables`,
 `active_sheet`, named `matrices`, imported point `series` and `history`. The
-legacy schema 1 `expression` is migrated into the first sheet on open; a newer
-`schema_version` is rejected instead of being silently misread. The launcher
-descriptor `craft-app.json` is independent of the document schema and stays at
-schema 1.
+legacy schema 1 `expression` is migrated into the first sheet on open; a schema
+2 legacy mirror is recognised without duplicating cells. A newer
+`schema_version` is rejected instead of being silently misread. Persisted
+numbers must be finite, and malformed matrices or CSV series are rejected.
+The launcher descriptor `craft-app.json` is independent of the document schema
+and stays at schema 1.
 
 ## Licence
 

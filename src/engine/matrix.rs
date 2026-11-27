@@ -16,6 +16,16 @@ pub enum MatrixError {
         /// The text that could not be parsed.
         token: String,
     },
+    /// A coefficient is NaN or infinite.
+    NonFinite {
+        /// The offending coefficient.
+        token: String,
+    },
+    /// A semicolon-separated row is empty.
+    EmptyRow {
+        /// One-based row number in the text form.
+        row: usize,
+    },
     /// Operand shapes do not allow the requested operation.
     DimensionMismatch {
         /// Shape of the left operand as `(rows, columns)`.
@@ -38,6 +48,10 @@ impl fmt::Display for MatrixError {
             Self::InvalidNumber { token } => {
                 write!(formatter, "invalid matrix coefficient '{token}'")
             }
+            Self::NonFinite { token } => {
+                write!(formatter, "matrix coefficient '{token}' must be finite")
+            }
+            Self::EmptyRow { row } => write!(formatter, "matrix row {row} is empty"),
             Self::DimensionMismatch { left, right } => write!(
                 formatter,
                 "incompatible matrix sizes {}x{} and {}x{}",
@@ -68,6 +82,17 @@ impl Serialize for Matrix {
     where
         S: serde::Serializer,
     {
+        if let Some(token) = self
+            .rows
+            .iter()
+            .flatten()
+            .find(|value| !value.is_finite())
+            .map(|value| crate::engine::format_value(*value))
+        {
+            return Err(serde::ser::Error::custom(format!(
+                "matrix coefficient '{token}' must be finite"
+            )));
+        }
         self.rows.serialize(serializer)
     }
 }
@@ -92,28 +117,56 @@ impl<'de> Deserialize<'de> for Matrix {
 }
 
 /// Parse the text form used by the UI: rows separated by `;` or a newline,
-/// coefficients separated by spaces, commas or tabs.
+/// coefficients separated by spaces, commas or tabs. Optional square brackets
+/// around rows are accepted, so [`Matrix::to_string`] output can be pasted back.
 ///
 /// # Errors
 ///
-/// Returns [`MatrixError::InvalidNumber`] for a non-numeric coefficient and
-/// [`MatrixError::Empty`] / [`MatrixError::Ragged`] for invalid shapes.
+/// Returns [`MatrixError::InvalidNumber`] for a non-numeric coefficient,
+/// [`MatrixError::NonFinite`] for NaN/infinity, and shape errors for empty or
+/// ragged input.
 pub fn parse_matrix(text: &str) -> Result<Matrix, MatrixError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(MatrixError::Empty);
+    }
     let mut rows = Vec::new();
-    for line in text.split([';', '\n']) {
-        let mut row = Vec::new();
-        for token in line.split(|character: char| character.is_whitespace() || character == ',') {
-            if token.is_empty() {
+    for section in text.split(';') {
+        if section.trim().is_empty() {
+            return Err(MatrixError::EmptyRow {
+                row: rows.len() + 1,
+            });
+        }
+        for line in section.lines() {
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
-            let value = token
-                .parse::<f64>()
-                .map_err(|_| MatrixError::InvalidNumber {
-                    token: token.to_owned(),
-                })?;
-            row.push(value);
-        }
-        if !row.is_empty() {
+            if line.starts_with('[') != line.ends_with(']') {
+                return Err(MatrixError::InvalidNumber {
+                    token: line.to_owned(),
+                });
+            }
+            let line = line.strip_prefix('[').unwrap_or(line);
+            let line = line.strip_suffix(']').unwrap_or(line);
+            let mut row = Vec::new();
+            for token in line.split(|character: char| character.is_whitespace() || character == ',')
+            {
+                if token.is_empty() {
+                    continue;
+                }
+                let value = token
+                    .parse::<f64>()
+                    .map_err(|_| MatrixError::InvalidNumber {
+                        token: token.to_owned(),
+                    })?;
+                row.push(value);
+            }
+            if row.is_empty() {
+                return Err(MatrixError::EmptyRow {
+                    row: rows.len() + 1,
+                });
+            }
             rows.push(row);
         }
     }
@@ -134,6 +187,11 @@ impl Matrix {
         let width = rows[0].len();
         if rows.iter().any(|row| row.len() != width) {
             return Err(MatrixError::Ragged);
+        }
+        if let Some(value) = rows.iter().flatten().find(|value| !value.is_finite()) {
+            return Err(MatrixError::NonFinite {
+                token: crate::engine::format_value(*value),
+            });
         }
         Ok(Self { rows })
     }
@@ -222,7 +280,7 @@ impl Matrix {
                     .collect::<Vec<_>>()
             })
             .collect();
-        Ok(Self { rows })
+        Self::new(rows)
     }
 
     /// Element-wise subtraction.
@@ -248,7 +306,7 @@ impl Matrix {
                     .collect::<Vec<_>>()
             })
             .collect();
-        Ok(Self { rows })
+        Self::new(rows)
     }
 
     /// Standard matrix product `self * other`.
@@ -275,19 +333,27 @@ impl Matrix {
                     .collect()
             })
             .collect();
-        Ok(Self { rows })
+        Self::new(rows)
     }
 
     /// Multiply every coefficient by a scalar.
-    #[must_use]
-    pub fn scale(&self, factor: f64) -> Self {
-        Self {
-            rows: self
-                .rows
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatrixError::NonFinite`] when the factor or a product is not
+    /// finite.
+    pub fn scale(&self, factor: f64) -> Result<Self, MatrixError> {
+        if !factor.is_finite() {
+            return Err(MatrixError::NonFinite {
+                token: crate::engine::format_value(factor),
+            });
+        }
+        Self::new(
+            self.rows
                 .iter()
                 .map(|row| row.iter().map(|value| value * factor).collect())
                 .collect(),
-        }
+        )
     }
 
     /// Transpose across the main diagonal.
@@ -321,7 +387,7 @@ impl Matrix {
                     pivot = row;
                 }
             }
-            if values[pivot][column].abs() < 1e-12 {
+            if values[pivot][column] == 0.0 {
                 return Ok(0.0);
             }
             if pivot != column {
@@ -337,7 +403,13 @@ impl Matrix {
                 }
             }
         }
-        Ok(determinant)
+        if determinant.is_finite() {
+            Ok(determinant)
+        } else {
+            Err(MatrixError::NonFinite {
+                token: crate::engine::format_value(determinant),
+            })
+        }
     }
 }
 
@@ -476,7 +548,10 @@ mod tests {
     #[test]
     fn scaling_and_display() {
         let matrix = Matrix::from_2x2(1.0, -2.0, 3.5, 4.0);
-        assert_eq!(matrix.scale(2.0), Matrix::from_2x2(2.0, -4.0, 7.0, 8.0));
+        assert_eq!(
+            matrix.scale(2.0).unwrap(),
+            Matrix::from_2x2(2.0, -4.0, 7.0, 8.0)
+        );
         assert_eq!(matrix.to_string(), "[1 -2]\n[3.5 4]");
     }
 
@@ -502,5 +577,54 @@ mod tests {
         assert_eq!(restored, matrix);
         let ragged = "[[1.0,2.0],[3.0]]";
         assert!(serde_json::from_str::<Matrix>(ragged).is_err());
+    }
+
+    #[test]
+    fn tiny_nonzero_pivots_are_not_treated_as_singular() {
+        let matrix = Matrix::new(vec![vec![1e-15, 0.0], vec![0.0, 1e-15]]).unwrap();
+        assert_eq!(matrix.det().unwrap(), 1e-30);
+    }
+
+    #[test]
+    fn non_finite_coefficients_and_overflow_are_rejected() {
+        assert!(matches!(
+            Matrix::new(vec![vec![f64::NAN]]),
+            Err(MatrixError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            parse_matrix("NaN"),
+            Err(MatrixError::NonFinite { .. })
+        ));
+        let large = Matrix::new(vec![vec![1e308]]).unwrap();
+        assert!(matches!(
+            large.scale(2.0),
+            Err(MatrixError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            large.mul(&large),
+            Err(MatrixError::NonFinite { .. })
+        ));
+        let large_square = Matrix::new(vec![vec![1e308, 0.0], vec![0.0, 1e308]]).unwrap();
+        assert!(matches!(
+            large_square.det(),
+            Err(MatrixError::NonFinite { .. })
+        ));
+        assert!(serde_json::to_string(&Matrix::from_2x2(1.0, f64::INFINITY, 2.0, 3.0)).is_err());
+    }
+
+    #[test]
+    fn matrix_display_and_optional_brackets_round_trip() {
+        let matrix = Matrix::new(vec![vec![1.0, 2.0], vec![3.0, 4.0]]).unwrap();
+        assert_eq!(parse_matrix(&matrix.to_string()).unwrap(), matrix);
+        assert_eq!(parse_matrix("[1 2]; [3 4]").unwrap(), matrix);
+        assert_eq!(
+            parse_matrix("1 2;;3 4"),
+            Err(MatrixError::EmptyRow { row: 2 })
+        );
+        assert_eq!(parse_matrix("1 2;"), Err(MatrixError::EmptyRow { row: 2 }));
+        assert!(matches!(
+            parse_matrix("[1 2; 3 4"),
+            Err(MatrixError::InvalidNumber { .. })
+        ));
     }
 }

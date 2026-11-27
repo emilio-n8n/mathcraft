@@ -13,7 +13,7 @@ use mathcraft::engine::csv;
 use mathcraft::engine::expr::{self, FUNCTION_NAMES};
 use mathcraft::engine::matrix::{self, MatrixError};
 use mathcraft::engine::plot::{self, PlotOptions, Sample};
-use mathcraft::engine::raster::{Color, Raster};
+use mathcraft::engine::raster;
 use mathcraft::engine::sheet;
 
 const FORMAT: &str = "mathcraft";
@@ -54,6 +54,8 @@ enum MatrixAction {
     Determinant,
     Transpose,
     Product,
+    Add,
+    Subtract,
 }
 
 /// The application state.
@@ -131,8 +133,10 @@ impl MathApp {
             Ok(mut host) => {
                 let mut document = host.history_mut().current_mut().clone();
                 document.normalize();
+                refresh_document(&mut document);
                 host.history_mut().replace(document);
                 self.host = host;
+                self.gesture_active = false;
                 self.selected_cell = 0;
                 self.shell.set_status(format!("Opened {}", path.display()));
             }
@@ -145,6 +149,7 @@ impl MathApp {
 
     fn new_document(&mut self) {
         self.host.reset(Document::default());
+        self.gesture_active = false;
         self.selected_cell = 0;
         self.matrix_result = None;
         self.shell.set_status("New document");
@@ -157,12 +162,18 @@ impl MathApp {
         }
     }
 
+    fn apply(&mut self, mutate: impl FnOnce(&mut Document)) -> bool {
+        self.finish_gesture();
+        self.host.apply(mutate)
+    }
+
     fn save(&mut self) -> bool {
         self.finish_gesture();
-        self.host.apply(Document::sync_legacy_expression);
         if self.host.path().is_none() {
             return self.save_as();
         }
+        self.refresh_results(false);
+        self.host.apply(Document::sync_legacy_expression);
         match self.host.save() {
             Ok(path) => {
                 self.shell.set_status(format!("Saved {}", path.display()));
@@ -178,11 +189,12 @@ impl MathApp {
 
     fn save_as(&mut self) -> bool {
         self.finish_gesture();
-        self.host.apply(Document::sync_legacy_expression);
         let default_name = format!("{}.json", slugify(&self.host.document().title));
         let Some(path) = dialogs::save_project("Save project", &default_name, "json") else {
             return false;
         };
+        self.refresh_results(false);
+        self.host.apply(Document::sync_legacy_expression);
         match self.host.save_as(path) {
             Ok(path) => {
                 self.shell.set_status(format!("Saved {}", path.display()));
@@ -312,50 +324,64 @@ impl MathApp {
         }
     }
 
-    /// Variables visible to the active sheet, including other sheets' results.
+    /// Variables visible to the active plot, computed from fresh workbook
+    /// results so cross-sheet references never use stale persisted values.
     fn evaluation_variables(&self) -> Vec<(String, f64)> {
         let document = self.host.document();
+        let outcomes = sheet::evaluate_workbook(&document.sheets, &document.variables);
         let mut variables = document.variables.clone();
-        for sheet in &document.sheets {
-            if let Some(result) = sheet.cells.iter().find_map(|cell| cell.result) {
-                variables.push((sheet.name.clone(), result));
+        for (sheet, outcomes) in document.sheets.iter().zip(&outcomes) {
+            if let Some(value) = outcomes.iter().find_map(|outcome| outcome.value) {
+                variables.push((sheet.name.clone(), value));
             }
-            for (index, cell) in sheet.cells.iter().enumerate() {
-                if let Some(result) = cell.result {
+            for (index, outcome) in outcomes.iter().enumerate() {
+                if let Some(value) = outcome.value {
                     variables.push((
                         format!("{}.{}", sheet.name, mathcraft::document::Cell::name(index)),
-                        result,
+                        value,
                     ));
+                    if document
+                        .active_sheet()
+                        .is_some_and(|active| active.name == sheet.name)
+                    {
+                        variables.push((mathcraft::document::Cell::name(index), value));
+                        variables
+                            .push((mathcraft::document::Cell::name(index).to_lowercase(), value));
+                    }
                 }
             }
         }
         variables
     }
 
-    fn evaluate_sheet(&mut self) {
-        let document = self.host.document().clone();
-        let Some(sheet) = document.active_sheet() else {
-            return;
+    fn refresh_results(&mut self, record_expressions: bool) {
+        let mut document = self.host.document().clone();
+        refresh_document(&mut document);
+        let expressions = if record_expressions {
+            document
+                .active_sheet()
+                .map(|sheet| {
+                    sheet
+                        .cells
+                        .iter()
+                        .filter(|cell| !cell.expression.trim().is_empty())
+                        .map(|cell| cell.expression.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        let variables = self.evaluation_variables();
-        let outcomes = sheet::evaluate_sheet(sheet, &variables);
-        let index = document.active_sheet;
-        let expressions = sheet
-            .cells
-            .iter()
-            .zip(&outcomes)
-            .filter(|(_, outcome)| outcome.value.is_some() || outcome.error.is_some())
-            .map(|(cell, _)| cell.expression.clone())
-            .collect::<Vec<_>>();
-        self.host.apply(|document| {
-            if let Some(sheet) = document.sheets.get_mut(index) {
-                sheet::apply_outcomes(sheet, &outcomes);
-            }
+        self.apply(|current| {
+            *current = document;
             for expression in expressions {
-                record_history(document, expression);
+                record_history(current, expression);
             }
-            document.sync_legacy_expression();
         });
+    }
+
+    fn evaluate_sheet(&mut self) {
+        self.refresh_results(true);
     }
 
     fn run_matrix_action(&mut self, action: MatrixAction) {
@@ -371,6 +397,10 @@ impl MathApp {
             MatrixAction::Transpose => Ok(left.transpose().to_string()),
             MatrixAction::Product => matrix::parse_matrix(&self.matrix_b)
                 .and_then(|right| left.mul(&right).map(|product| product.to_string())),
+            MatrixAction::Add => matrix::parse_matrix(&self.matrix_b)
+                .and_then(|right| left.add(&right).map(|sum| sum.to_string())),
+            MatrixAction::Subtract => matrix::parse_matrix(&self.matrix_b)
+                .and_then(|right| left.sub(&right).map(|difference| difference.to_string())),
         };
         self.matrix_result = Some(outcome.map_err(|error: MatrixError| error.to_string()));
     }
@@ -388,7 +418,7 @@ impl MathApp {
                 return;
             }
         };
-        self.host.apply(|document| {
+        self.apply(|document| {
             if let Some(entry) = document
                 .matrices
                 .iter_mut()
@@ -406,38 +436,42 @@ impl MathApp {
     }
 
     fn import_csv(&mut self) {
-        let points = match csv::parse_points(&self.csv_text) {
-            Ok(points) => points,
+        let name = self.series_name.trim();
+        let name = if name.is_empty() { "series" } else { name };
+        let imported = match csv::parse_series(&self.csv_text, name) {
+            Ok(series) => series,
             Err(error) => {
                 self.import_status = Some(Err(error.to_string()));
                 return;
             }
         };
-        let name = self.series_name.trim();
-        let name = if name.is_empty() { "series" } else { name }.to_owned();
-        self.host.apply(|document| {
-            if let Some(series) = document
-                .series
-                .iter_mut()
-                .find(|series| series.name == name)
-            {
-                series.points = points.clone();
-            } else {
-                document.series.push(NamedSeries {
-                    name: name.clone(),
-                    points: points.clone(),
-                });
+        let point_count = imported
+            .iter()
+            .map(|(_, points)| points.len())
+            .sum::<usize>();
+        let series_count = imported.len();
+        self.apply(|document| {
+            for (name, points) in imported {
+                if let Some(series) = document
+                    .series
+                    .iter_mut()
+                    .find(|series| series.name.eq_ignore_ascii_case(&name))
+                {
+                    series.points = points;
+                } else {
+                    document.series.push(NamedSeries { name, points });
+                }
             }
         });
         self.import_status = Some(Ok(format!(
-            "Imported {} points into '{name}'",
-            points.len()
+            "Imported {point_count} points into {series_count} series"
         )));
     }
 
     fn export_sheet_csv(&mut self) {
         self.finish_gesture();
-        let document = self.host.document();
+        let mut document = self.host.document().clone();
+        refresh_document(&mut document);
         let Some(sheet) = document.active_sheet() else {
             return;
         };
@@ -570,7 +604,7 @@ impl MathApp {
             .iter()
             .map(|expression| (*expression).to_owned())
             .collect::<Vec<_>>();
-        self.host.apply(|document| {
+        self.apply(|document| {
             if let Some(sheet) = document.active_sheet_mut() {
                 sheet.cells = expressions
                     .iter()
@@ -590,7 +624,8 @@ impl MathApp {
         let mut remove_variable = None;
         let mut add_variable = false;
         let mut remove_matrix = None;
-        let mut load_matrix = None;
+        let mut load_matrix_a = None;
+        let mut load_matrix_b = None;
         let mut remove_series = None;
         let mut picked_history = None;
         let mut variable_focus_gained = false;
@@ -605,6 +640,10 @@ impl MathApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         widgets::section_label(ui, "Variables");
+                        // Snapshot before egui can mutate a field. Starting a
+                        // gesture is idempotent, so focus moves within this
+                        // panel remain one undo step.
+                        self.host.history_mut().begin_gesture();
                         for (index, (name, value)) in self
                             .host
                             .history_mut()
@@ -614,9 +653,18 @@ impl MathApp {
                             .enumerate()
                         {
                             ui.horizontal(|ui| {
+                                let previous_value = *value;
                                 let name_response =
                                     ui.add(egui::TextEdit::singleline(name).desired_width(78.0));
                                 let value_response = ui.add(egui::DragValue::new(value).speed(0.1));
+                                if !value.is_finite() {
+                                    *value = previous_value;
+                                    self.shell.notify(
+                                        Tone::Error,
+                                        "Invalid variable",
+                                        "Variable values must be finite",
+                                    );
+                                }
                                 variable_focus_gained |=
                                     name_response.gained_focus() || value_response.gained_focus();
                                 variable_focus_lost |=
@@ -640,18 +688,31 @@ impl MathApp {
                             }
                         });
                         if let Some(index) = remove_variable {
-                            self.host.apply(|document| {
+                            self.apply(|document| {
                                 document.variables.remove(index);
                             });
                         }
                         if add_variable {
                             let name = self.new_variable_name.trim().to_owned();
-                            if !name.is_empty() {
-                                let value = self.new_variable_value;
-                                self.host.apply(|document| {
+                            let value = self.new_variable_value;
+                            if name.is_empty() || !expr::is_identifier(&name) {
+                                self.shell.notify(
+                                    Tone::Error,
+                                    "Invalid variable name",
+                                    "Use letters, digits, underscores or dotted names",
+                                );
+                            } else if !value.is_finite() {
+                                self.shell.notify(
+                                    Tone::Error,
+                                    "Invalid variable",
+                                    "Variable values must be finite",
+                                );
+                            } else {
+                                self.apply(|document| {
                                     if let Some(entry) = document
                                         .variables
                                         .iter_mut()
+                                        .rev()
                                         .find(|(existing, _)| existing == &name)
                                     {
                                         entry.1 = value;
@@ -681,8 +742,11 @@ impl MathApp {
                                     ))
                                     .color(theme::MUTED),
                                 );
-                                if ui.small_button("load").clicked() {
-                                    load_matrix = Some(entry.matrix.to_string());
+                                if ui.small_button("A").clicked() {
+                                    load_matrix_a = Some(entry.matrix.to_string());
+                                }
+                                if ui.small_button("B").clicked() {
+                                    load_matrix_b = Some(entry.matrix.to_string());
                                 }
                                 if ui.small_button("x").clicked() {
                                     remove_matrix = Some(index);
@@ -740,23 +804,27 @@ impl MathApp {
                     });
             });
 
-        if let Some(text) = load_matrix {
-            self.matrix_a = matrix_text_from_rows(&text);
+        if let Some(text) = load_matrix_a {
+            self.matrix_a = text;
             self.matrix_result = Some(Ok("Matrix loaded into A".to_owned()));
         }
+        if let Some(text) = load_matrix_b {
+            self.matrix_b = text;
+            self.matrix_result = Some(Ok("Matrix loaded into B".to_owned()));
+        }
         if let Some(index) = remove_matrix {
-            self.host.apply(|document| {
+            self.apply(|document| {
                 document.matrices.remove(index);
             });
         }
         if let Some(index) = remove_series {
-            self.host.apply(|document| {
+            self.apply(|document| {
                 document.series.remove(index);
             });
         }
         if let Some(expression) = picked_history {
             let index = self.selected_cell;
-            self.host.apply(|document| {
+            self.apply(|document| {
                 if let Some(cell) = document
                     .active_sheet_mut()
                     .and_then(|sheet| sheet.cells.get_mut(index))
@@ -766,10 +834,10 @@ impl MathApp {
             });
         }
         if variable_focus_gained {
-            self.host.history_mut().begin_gesture();
+            self.gesture_active = true;
         }
-        if variable_focus_lost {
-            self.host.history_mut().end_gesture();
+        if variable_focus_lost && !variable_focus_gained {
+            self.finish_gesture();
         }
     }
 
@@ -785,33 +853,46 @@ impl MathApp {
 
         let document = self.host.document().clone();
         ui.horizontal(|ui| {
-            for (index, sheet) in document.sheets.iter().enumerate() {
-                if ui
-                    .selectable_label(index == document.active_sheet, &sheet.name)
-                    .clicked()
-                {
-                    self.host.apply(|document| document.active_sheet = index);
+            egui::ScrollArea::horizontal()
+                .id_salt("sheet-tabs")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, sheet) in document.sheets.iter().enumerate() {
+                            if ui
+                                .selectable_label(index == document.active_sheet, &sheet.name)
+                                .clicked()
+                            {
+                                self.apply(|document| document.active_sheet = index);
+                                self.selected_cell = 0;
+                            }
+                        }
+                    });
+                });
+            if ui.small_button("+").clicked() {
+                let requested = self.sheet_name_input.trim();
+                let name = if requested.is_empty() {
+                    next_sheet_name(&document)
+                } else {
+                    requested.to_owned()
+                };
+                if !sheet_name_available(&document, &name, None) {
+                    self.shell
+                        .set_status(format!("Sheet name '{name}' is empty or already in use"));
+                } else {
+                    self.apply(|document| {
+                        document.sheets.push(Sheet::new(name));
+                        document.active_sheet = document.sheets.len() - 1;
+                    });
+                    self.sheet_name_input.clear();
                     self.selected_cell = 0;
                 }
             }
-            if ui.small_button("+").clicked() {
-                let name = if self.sheet_name_input.trim().is_empty() {
-                    format!("Sheet {}", document.sheets.len() + 1)
-                } else {
-                    self.sheet_name_input.trim().to_owned()
-                };
-                self.host.apply(|document| {
-                    document.sheets.push(Sheet::new(name));
-                    document.active_sheet = document.sheets.len() - 1;
-                });
-                self.sheet_name_input.clear();
-                self.selected_cell = 0;
-            }
             if document.sheets.len() > 1 && ui.small_button("-").clicked() {
-                let index = document.active_sheet;
-                self.host.apply(|document| {
+                self.apply(|document| {
+                    let index = document.active_sheet.min(document.sheets.len() - 1);
                     document.sheets.remove(index);
-                    document.active_sheet = document.active_sheet.saturating_sub(1);
+                    document.active_sheet = index.min(document.sheets.len() - 1);
                 });
                 self.selected_cell = 0;
             }
@@ -822,6 +903,20 @@ impl MathApp {
                     .hint_text("new sheet name")
                     .desired_width(150.0),
             );
+            if ui.button("Rename").clicked() {
+                let name = self.sheet_name_input.trim().to_owned();
+                if !sheet_name_available(&document, &name, Some(document.active_sheet)) {
+                    self.shell
+                        .set_status(format!("Sheet name '{name}' is empty or already in use"));
+                } else {
+                    self.apply(|document| {
+                        if let Some(sheet) = document.active_sheet_mut() {
+                            sheet.name = name;
+                        }
+                    });
+                    self.sheet_name_input.clear();
+                }
+            }
         });
 
         let Some(sheet) = document.active_sheet() else {
@@ -842,6 +937,9 @@ impl MathApp {
                 let gained_focus;
                 let lost_focus;
                 {
+                    // Capture the pre-edit snapshot before egui processes the
+                    // first keystroke, not one frame after focus was gained.
+                    self.host.history_mut().begin_gesture();
                     let target = self
                         .host
                         .history_mut()
@@ -864,7 +962,7 @@ impl MathApp {
                 if gained_focus {
                     self.gesture_active = true;
                 }
-                if lost_focus {
+                if lost_focus && !gained_focus {
                     self.finish_gesture();
                 }
                 match (&cell.result, &cell.error) {
@@ -875,12 +973,17 @@ impl MathApp {
                         );
                     }
                     (None, Some(error)) => {
-                        ui.label(RichText::new(format!("Error: {error}")).color(theme::ERROR));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Error: {error}")).color(theme::ERROR),
+                            )
+                            .wrap(),
+                        );
                     }
                     _ => {}
                 }
                 if sheet.cells.len() > 1 && ui.small_button("x").clicked() {
-                    self.host.apply(|document| {
+                    self.apply(|document| {
                         if let Some(sheet) = document.sheets.get_mut(document.active_sheet) {
                             sheet.cells.remove(cell_index);
                         }
@@ -890,7 +993,7 @@ impl MathApp {
             });
         }
         if ui.button("Add cell").clicked() {
-            self.host.apply(|document| {
+            self.apply(|document| {
                 if let Some(sheet) = document.active_sheet_mut() {
                     sheet.cells.push(mathcraft::document::Cell::new(""));
                 }
@@ -905,7 +1008,7 @@ impl MathApp {
         ui.collapsing("Syntax help", |ui| {
             ui.label(RichText::new("Operators: + - * / ^ · implicit products: 2x, 2(x+1) · constants: pi, e").color(theme::MUTED));
             ui.label(RichText::new(format!("Functions: {}", FUNCTION_NAMES.join(", "))).color(theme::MUTED));
-            ui.label(RichText::new("Cell references: A1, A2 (case-insensitive) · sheet names and variables are also in scope.").color(theme::MUTED));
+            ui.label(RichText::new("Cell references: A1, A2 (case-insensitive) · cross-sheet: Plot.A1 or 'My Sheet'.A1 · scientific notation: 1.5e-3.").color(theme::MUTED));
         });
     }
 
@@ -947,6 +1050,8 @@ impl MathApp {
     }
 
     fn plot_panel(&mut self, ui: &mut egui::Ui) {
+        let previous_x = (self.plot_x_min, self.plot_x_max);
+        let previous_y = (self.plot_y_min, self.plot_y_max);
         ui.horizontal(|ui| {
             ui.label("Plot y = f(x)");
             ui.checkbox(&mut self.show_all_curves, "All cells");
@@ -967,21 +1072,23 @@ impl MathApp {
                         .speed(0.1)
                         .prefix("x min "),
                 );
-                let mut auto = self.plot_y_min.is_none() || self.plot_y_max.is_none();
+                let mut auto = self.plot_y_min.is_none() && self.plot_y_max.is_none();
                 if ui.checkbox(&mut auto, "Auto Y").clicked() {
                     if auto {
                         self.plot_y_min = None;
                         self.plot_y_max = None;
                     } else {
-                        let bounds = plot::y_bounds(
-                            &self
-                                .plot_curves()
-                                .into_iter()
-                                .flat_map(|(_, points)| points)
-                                .collect::<Vec<_>>(),
-                        );
-                        self.plot_y_min = Some(bounds.0);
-                        self.plot_y_max = Some(bounds.1);
+                        let curves = self.plot_curves();
+                        let points = curves
+                            .iter()
+                            .flat_map(|(_, points)| points.iter().copied())
+                            .filter(|point| {
+                                point.x >= self.plot_x_min && point.x <= self.plot_x_max
+                            })
+                            .collect::<Vec<_>>();
+                        let (low, high) = plot::y_bounds(&points);
+                        self.plot_y_min = Some(low);
+                        self.plot_y_max = Some(high);
                     }
                 }
                 if !auto {
@@ -995,54 +1102,87 @@ impl MathApp {
             });
         });
 
+        if !valid_range(self.plot_x_min, self.plot_x_max) {
+            (self.plot_x_min, self.plot_x_max) = previous_x;
+            self.shell
+                .set_status("X range must be finite and increasing");
+        }
+        let y_range = match (self.plot_y_min, self.plot_y_max) {
+            (None, None) => None,
+            (Some(low), Some(high)) if valid_range(low, high) => Some((low, high)),
+            _ => {
+                self.shell
+                    .set_status("Y range must be finite and increasing");
+                match previous_y {
+                    (Some(low), Some(high)) if valid_range(low, high) => {
+                        (self.plot_y_min, self.plot_y_max) = previous_y;
+                        Some((low, high))
+                    }
+                    _ => {
+                        self.plot_y_min = None;
+                        self.plot_y_max = None;
+                        None
+                    }
+                }
+            }
+        };
+
         let curves = self.plot_curves();
-        let all_points = curves
+        let visible_points = curves
             .iter()
             .flat_map(|(_, points)| points.iter().copied())
+            .filter(|point| {
+                point.x.is_finite()
+                    && point.y.is_finite()
+                    && point.x >= self.plot_x_min
+                    && point.x <= self.plot_x_max
+            })
             .collect::<Vec<_>>();
-        let (auto_low, auto_high) = plot::y_bounds(&all_points);
-        let y_min = self.plot_y_min.unwrap_or(auto_low);
-        let y_max = self.plot_y_max.unwrap_or(auto_high);
+        let (auto_low, auto_high) = plot::y_bounds(&visible_points);
+        let (y_min, y_max) = y_range.unwrap_or((auto_low, auto_high));
 
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), PLOT_HEIGHT),
+            egui::vec2(ui.available_width().max(1.0), PLOT_HEIGHT),
             egui::Sense::click_and_drag(),
         );
-        let span_x = (self.plot_x_max - self.plot_x_min).max(1e-9);
-        let span_y = (y_max - y_min).max(1e-9);
 
-        if response.dragged() {
+        if response.dragged() && rect.width() > 0.0 && rect.height() > 0.0 {
             let delta = response.drag_delta();
-            self.plot_x_min -= delta.x as f64 / rect.width() as f64 * span_x;
-            self.plot_x_max -= delta.x as f64 / rect.width() as f64 * span_x;
-            let shift = delta.y as f64 / rect.height() as f64 * span_y;
-            if let (Some(low), Some(high)) = (self.plot_y_min, self.plot_y_max) {
-                self.plot_y_min = Some(low + shift);
-                self.plot_y_max = Some(high + shift);
-            } else {
-                self.plot_y_min = Some(auto_low + shift);
-                self.plot_y_max = Some(auto_high + shift);
+            if let Some((low, high)) = pan_range(
+                self.plot_x_min,
+                self.plot_x_max,
+                -delta.x as f64 / rect.width() as f64,
+            ) {
+                self.plot_x_min = low;
+                self.plot_x_max = high;
+            }
+            if let Some((low, high)) =
+                pan_range(y_min, y_max, delta.y as f64 / rect.height() as f64)
+            {
+                self.plot_y_min = Some(low);
+                self.plot_y_max = Some(high);
             }
         }
-        if response.hovered() {
+        if response.hovered() && rect.width() > 0.0 && rect.height() > 0.0 {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
-                let factor = if scroll > 0.0 {
-                    0.85_f64
-                } else {
-                    1.0 / 0.85_f64
-                };
-                let anchor_x = response
-                    .hover_pos()
-                    .map_or((self.plot_x_min + self.plot_x_max) / 2.0, |pos| {
-                        self.plot_x_min + ((pos.x - rect.left()) / rect.width()) as f64 * span_x
-                    });
-                self.plot_x_min = anchor_x + (self.plot_x_min - anchor_x) * factor;
-                self.plot_x_max = anchor_x + (self.plot_x_max - anchor_x) * factor;
-                if let (Some(low), Some(high)) = (self.plot_y_min, self.plot_y_max) {
-                    let mid = (low + high) / 2.0;
-                    self.plot_y_min = Some(mid + (low - mid) * factor);
-                    self.plot_y_max = Some(mid + (high - mid) * factor);
+                let factor = if scroll > 0.0 { 0.85_f64 } else { 1.0 / 0.85 };
+                let pointer = response.hover_pos().unwrap_or(rect.center());
+                let x_fraction =
+                    ((pointer.x - rect.left()) as f64 / rect.width() as f64).clamp(0.0, 1.0);
+                let y_fraction =
+                    ((pointer.y - rect.top()) as f64 / rect.height() as f64).clamp(0.0, 1.0);
+                let anchor_x = interpolate(self.plot_x_min, self.plot_x_max, x_fraction);
+                if let Some((low, high)) =
+                    zoom_range(self.plot_x_min, self.plot_x_max, anchor_x, factor)
+                {
+                    self.plot_x_min = low;
+                    self.plot_x_max = high;
+                }
+                let anchor_y = interpolate(y_max, y_min, y_fraction);
+                if let Some((low, high)) = zoom_range(y_min, y_max, anchor_y, factor) {
+                    self.plot_y_min = Some(low);
+                    self.plot_y_max = Some(high);
                 }
             }
         }
@@ -1056,7 +1196,10 @@ impl MathApp {
             y_min,
             y_max,
         );
-        ui.label(RichText::new("Drag to pan · scroll to zoom").color(theme::FAINT));
+        ui.label(
+            RichText::new("Drag to pan · scroll to zoom · zoom is anchored at the pointer")
+                .color(theme::FAINT),
+        );
 
         ui.horizontal(|ui| {
             if ui.button("Export plot CSV").clicked() {
@@ -1074,14 +1217,22 @@ impl MathApp {
     }
 
     fn export_plot_png(&mut self, curves: &[(String, Vec<Sample>)], y_min: f64, y_max: f64) {
-        let slices = curves
-            .iter()
-            .map(|(_, points)| points.as_slice())
-            .collect::<Vec<_>>();
-        let raster = raster_plot(&slices, self.plot_x_min, self.plot_x_max, y_min, y_max);
         let Some(path) = dialogs::save_project("Export plot PNG", "plot.png", "png") else {
             return;
         };
+        let named = curves
+            .iter()
+            .map(|(name, points)| (name.clone(), points.as_slice()))
+            .collect::<Vec<_>>();
+        let raster = raster::render_plot_named(
+            &named,
+            self.plot_x_min,
+            self.plot_x_max,
+            y_min,
+            y_max,
+            960,
+            540,
+        );
         match raster.save(&path) {
             Ok(()) => self
                 .shell
@@ -1101,11 +1252,19 @@ impl MathApp {
         );
         ui.horizontal(|ui| {
             ui.label("A");
-            ui.add(egui::TextEdit::singleline(&mut self.matrix_a).desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::multiline(&mut self.matrix_a)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("B");
-            ui.add(egui::TextEdit::singleline(&mut self.matrix_b).desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::multiline(&mut self.matrix_b)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
         });
         ui.horizontal(|ui| {
             if ui.button("det(A)").clicked() {
@@ -1116,6 +1275,12 @@ impl MathApp {
             }
             if ui.button("A x B").clicked() {
                 self.run_matrix_action(MatrixAction::Product);
+            }
+            if ui.button("A + B").clicked() {
+                self.run_matrix_action(MatrixAction::Add);
+            }
+            if ui.button("A - B").clicked() {
+                self.run_matrix_action(MatrixAction::Subtract);
             }
         });
         ui.horizontal(|ui| {
@@ -1129,10 +1294,13 @@ impl MathApp {
                 Ok(value) => (value.clone(), theme::SUCCESS),
                 Err(message) => (format!("Error: {message}"), theme::ERROR),
             };
-            ui.label(
-                RichText::new(text)
-                    .font(egui::FontId::monospace(13.0))
-                    .color(color),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .font(egui::FontId::monospace(13.0))
+                        .color(color),
+                )
+                .wrap(),
             );
         }
     }
@@ -1140,7 +1308,7 @@ impl MathApp {
     fn csv_panel(&mut self, ui: &mut egui::Ui) {
         widgets::section_label(ui, "Import CSV points");
         ui.label(
-            RichText::new("Two columns x,y with an optional header")
+            RichText::new("CSV columns x,y,z,... with an optional header; one series per Y column")
                 .size(11.0)
                 .color(theme::MUTED),
         );
@@ -1212,8 +1380,16 @@ impl MathApp {
     }
 }
 
+fn refresh_document(document: &mut Document) {
+    let outcomes = sheet::evaluate_workbook(&document.sheets, &document.variables);
+    for (sheet, outcomes) in document.sheets.iter_mut().zip(outcomes) {
+        sheet::apply_outcomes(sheet, &outcomes);
+    }
+    document.sync_legacy_expression();
+}
+
 fn record_history(document: &mut Document, expression: String) {
-    if expression.trim().is_empty() {
+    if expression.trim().is_empty() || document.history.last() == Some(&expression) {
         return;
     }
     document.history.push(expression);
@@ -1222,61 +1398,61 @@ fn record_history(document: &mut Document, expression: String) {
     }
 }
 
-fn matrix_text_from_rows(text: &str) -> String {
-    text.lines()
-        .map(|line| line.trim_matches(['[', ']']).to_owned())
-        .collect::<Vec<_>>()
-        .join("; ")
+fn sheet_name_available(document: &Document, name: &str, except: Option<usize>) -> bool {
+    !name.trim().is_empty()
+        && !document.sheets.iter().enumerate().any(|(index, sheet)| {
+            Some(index) != except && sheet.name.eq_ignore_ascii_case(name.trim())
+        })
 }
 
-const PLOT_COLORS: [Color; 6] = [
-    [106, 168, 245, 255],
-    [84, 209, 132, 255],
-    [238, 180, 86, 255],
-    [232, 87, 63, 255],
-    [178, 132, 245, 255],
-    [96, 214, 200, 255],
-];
-
-fn raster_plot(curves: &[&[Sample]], x_min: f64, x_max: f64, y_min: f64, y_max: f64) -> Raster {
-    const WIDTH: usize = 960;
-    const HEIGHT: usize = 540;
-    let mut raster = Raster::new(WIDTH, HEIGHT, [16, 18, 24, 255]);
-    let span_x = (x_max - x_min).max(1e-9);
-    let span_y = (y_max - y_min).max(1e-9);
-    let to_pixel = |x: f64, y: f64| -> (i32, i32) {
-        (
-            ((x - x_min) / span_x * (WIDTH - 1) as f64).round() as i32,
-            ((y_max - y) / span_y * (HEIGHT - 1) as f64).round() as i32,
-        )
-    };
-    for tick in 0..=8 {
-        let (px, _) = to_pixel(x_min + span_x * tick as f64 / 8.0, y_min);
-        raster.draw_line(px, 0, px, HEIGHT as i32 - 1, [40, 44, 54, 255]);
-    }
-    for tick in 0..=4 {
-        let (_, py) = to_pixel(x_min, y_min + span_y * tick as f64 / 4.0);
-        raster.draw_line(0, py, WIDTH as i32 - 1, py, [40, 44, 54, 255]);
-    }
-    if (x_min..=x_max).contains(&0.0) {
-        let (px, _) = to_pixel(0.0, y_min);
-        raster.draw_line(px, 0, px, HEIGHT as i32 - 1, [72, 80, 96, 255]);
-    }
-    if (y_min..=y_max).contains(&0.0) {
-        let (_, py) = to_pixel(x_min, 0.0);
-        raster.draw_line(0, py, WIDTH as i32 - 1, py, [72, 80, 96, 255]);
-    }
-    for (index, points) in curves.iter().enumerate() {
-        let color = PLOT_COLORS[index % PLOT_COLORS.len()];
-        for pair in points.windows(2) {
-            if pair[0].y.is_finite() && pair[1].y.is_finite() {
-                let (x0, y0) = to_pixel(pair[0].x, pair[0].y);
-                let (x1, y1) = to_pixel(pair[1].x, pair[1].y);
-                raster.draw_line(x0, y0, x1, y1, color);
-            }
+fn next_sheet_name(document: &Document) -> String {
+    for number in 1.. {
+        let candidate = format!("Sheet {number}");
+        if sheet_name_available(document, &candidate, None) {
+            return candidate;
         }
     }
-    raster
+    String::new()
+}
+
+fn valid_range(minimum: f64, maximum: f64) -> bool {
+    minimum.is_finite() && maximum.is_finite() && minimum < maximum
+}
+
+fn interpolate(minimum: f64, maximum: f64, fraction: f64) -> f64 {
+    if !valid_range(minimum, maximum) || !fraction.is_finite() {
+        return minimum;
+    }
+    let span = maximum - minimum;
+    if span.is_finite() {
+        minimum + span * fraction
+    } else {
+        minimum * (1.0 - fraction) + maximum * fraction
+    }
+}
+
+fn pan_range(minimum: f64, maximum: f64, fraction: f64) -> Option<(f64, f64)> {
+    if !valid_range(minimum, maximum) || !fraction.is_finite() {
+        return None;
+    }
+    let span = maximum - minimum;
+    if !span.is_finite() {
+        return None;
+    }
+    let shift = span * fraction;
+    let low = minimum - shift;
+    let high = maximum - shift;
+    valid_range(low, high).then_some((low, high))
+}
+
+fn zoom_range(minimum: f64, maximum: f64, anchor: f64, factor: f64) -> Option<(f64, f64)> {
+    if !valid_range(minimum, maximum) || !anchor.is_finite() || !factor.is_finite() || factor <= 0.0
+    {
+        return None;
+    }
+    let low = anchor + (minimum - anchor) * factor;
+    let high = anchor + (maximum - anchor) * factor;
+    valid_range(low, high).then_some((low, high))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1289,12 +1465,10 @@ fn paint_plot(
     y_min: f64,
     y_max: f64,
 ) {
-    let span_x = (x_max - x_min).max(1e-9);
-    let span_y = (y_max - y_min).max(1e-9);
     let to_screen = |x: f64, y: f64| {
         egui::pos2(
-            rect.left() + ((x - x_min) / span_x) as f32 * rect.width(),
-            rect.bottom() - ((y - y_min) / span_y) as f32 * rect.height(),
+            rect.left() + plot::normalized(x, x_min, x_max) as f32 * rect.width(),
+            rect.bottom() - plot::normalized(y, y_min, y_max) as f32 * rect.height(),
         )
     };
 
@@ -1306,8 +1480,7 @@ fn paint_plot(
         egui::StrokeKind::Inside,
     );
     let grid = egui::Stroke::new(1.0, theme::BORDER);
-    for tick in 0..=8 {
-        let x = x_min + span_x * tick as f64 / 8.0;
+    for x in plot::axis_ticks(x_min, x_max, 9) {
         let top = to_screen(x, y_max);
         painter.line_segment(
             [
@@ -1319,13 +1492,12 @@ fn paint_plot(
         painter.text(
             egui::pos2(top.x, rect.bottom() - 3.0),
             egui::Align2::CENTER_BOTTOM,
-            format!("{x:.1}"),
+            expr::format_value(x),
             egui::FontId::proportional(10.0),
             theme::FAINT,
         );
     }
-    for tick in 0..=4 {
-        let y = y_min + span_y * tick as f64 / 4.0;
+    for y in plot::axis_ticks(y_min, y_max, 5) {
         let left = to_screen(x_min, y);
         painter.line_segment(
             [
@@ -1337,7 +1509,7 @@ fn paint_plot(
         painter.text(
             egui::pos2(rect.left() + 4.0, left.y),
             egui::Align2::LEFT_CENTER,
-            format!("{y:.1}"),
+            expr::format_value(y),
             egui::FontId::proportional(10.0),
             theme::FAINT,
         );
@@ -1368,19 +1540,28 @@ fn paint_plot(
         let color = legend[index % legend.len()];
         let curve = egui::Stroke::new(2.0, color);
         for pair in points.windows(2) {
-            if pair[0].y.is_finite() && pair[1].y.is_finite() {
-                painter.line_segment(
-                    [
-                        to_screen(pair[0].x, pair[0].y),
-                        to_screen(pair[1].x, pair[1].y),
-                    ],
-                    curve,
-                );
+            if [pair[0].x, pair[0].y, pair[1].x, pair[1].y]
+                .iter()
+                .all(|value| value.is_finite())
+            {
+                let start = to_screen(pair[0].x, pair[0].y);
+                let end = to_screen(pair[1].x, pair[1].y);
+                if [start.x, start.y, end.x, end.y]
+                    .iter()
+                    .all(|value| value.is_finite())
+                {
+                    painter.line_segment([start, end], curve);
+                }
             }
         }
+        let column = index % 6;
+        let row = index / 6;
         painter.text(
-            egui::pos2(rect.right() - 6.0 - index as f32 * 74.0, rect.top() + 12.0),
-            egui::Align2::RIGHT_CENTER,
+            egui::pos2(
+                rect.left() + 8.0 + column as f32 * 74.0,
+                rect.top() + 10.0 + row as f32 * 14.0,
+            ),
+            egui::Align2::LEFT_CENTER,
             name,
             egui::FontId::proportional(10.0),
             color,
@@ -1440,15 +1621,61 @@ mod tests {
     #[test]
     fn matrix_display_can_be_reloaded_from_text() {
         let matrix = Matrix::from_2x2(1.0, 2.0, 3.0, 4.0);
-        let text = matrix_text_from_rows(&matrix.to_string());
-        assert_eq!(matrix::parse_matrix(&text).unwrap(), matrix);
+        assert_eq!(matrix::parse_matrix(&matrix.to_string()).unwrap(), matrix);
     }
 
     #[test]
     fn png_export_raster_has_expected_size() {
         let points = vec![Sample { x: 0.0, y: 0.0 }, Sample { x: 1.0, y: 1.0 }];
-        let raster = raster_plot(&[&points], 0.0, 1.0, 0.0, 1.0);
+        let named = [("A1".to_owned(), points.as_slice())];
+        let raster = raster::render_plot_named(&named, 0.0, 1.0, 0.0, 1.0, 960, 540);
         let bytes = raster.to_png().unwrap();
         assert_eq!(&bytes[16..24], &[0, 0, 3, 192, 0, 0, 2, 28]);
+    }
+
+    #[test]
+    fn history_deduplicates_consecutive_evaluations() {
+        let mut document = Document::default();
+        record_history(&mut document, "1+1".to_owned());
+        record_history(&mut document, "1+1".to_owned());
+        record_history(&mut document, "2+2".to_owned());
+        assert_eq!(document.history, vec!["1+1", "2+2"]);
+    }
+
+    #[test]
+    fn sheet_names_are_unique_and_auto_names_reuse_gaps() {
+        let mut document = Document::default();
+        document.sheets.push(Sheet::new("Data"));
+        assert!(sheet_name_available(&document, "Notes", None));
+        assert!(!sheet_name_available(&document, "data", None));
+        assert!(sheet_name_available(&document, "DATA", Some(1)));
+        document.sheets.remove(0);
+        assert_eq!(next_sheet_name(&document), "Sheet 1");
+    }
+
+    #[test]
+    fn plot_pan_and_zoom_preserve_valid_ranges_and_the_anchor() {
+        assert_eq!(pan_range(0.0, 10.0, 0.1), Some((-1.0, 9.0)));
+        assert_eq!(zoom_range(0.0, 10.0, 4.0, 0.5), Some((2.0, 7.0)));
+        assert!(pan_range(0.0, 10.0, f64::INFINITY).is_none());
+        assert!(zoom_range(0.0, 10.0, 4.0, 0.0).is_none());
+        assert_eq!(interpolate(-1e308, 1e308, 0.5), 0.0);
+    }
+
+    #[test]
+    fn refresh_document_updates_cross_sheet_results_and_legacy_expression() {
+        let mut first = Sheet::new("First");
+        first.cells = vec![mathcraft::document::Cell::new("2")];
+        let mut second = Sheet::new("Second");
+        second.cells = vec![mathcraft::document::Cell::new("First.A1 * 3")];
+        let mut document = Document {
+            sheets: vec![first, second],
+            active_sheet: 1,
+            ..Document::default()
+        };
+        refresh_document(&mut document);
+        assert_eq!(document.sheets[0].cells[0].result, Some(2.0));
+        assert_eq!(document.sheets[1].cells[0].result, Some(6.0));
+        assert_eq!(document.expression, "First.A1 * 3");
     }
 }

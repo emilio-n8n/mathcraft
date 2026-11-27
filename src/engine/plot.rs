@@ -71,19 +71,28 @@ pub fn sample_expr(
             message: "a plot needs at least two samples".to_owned(),
         });
     }
+    if samples > 100_000 {
+        return Err(MathError::Evaluation {
+            message: "a plot accepts at most 100000 samples".to_owned(),
+        });
+    }
     if !x_min.is_finite() || !x_max.is_finite() || x_min >= x_max {
         return Err(MathError::Evaluation {
             message: "the plot interval must be finite and increasing".to_owned(),
         });
     }
 
-    let step = (x_max - x_min) / (samples - 1) as f64;
+    let span = x_max - x_min;
     let mut result = Vec::with_capacity(samples);
     for index in 0..samples {
         let x = if index + 1 == samples {
             x_max
+        } else if span.is_finite() {
+            let fraction = index as f64 / (samples - 1) as f64;
+            x_min + span * fraction
         } else {
-            x_min + step * index as f64
+            let fraction = index as f64 / (samples - 1) as f64;
+            x_min * (1.0 - fraction) + x_max * fraction
         };
         let mut scoped = variables.to_vec();
         scoped.push(("x".to_owned(), x));
@@ -107,15 +116,91 @@ pub fn y_bounds(samples: &[Sample]) -> (f64, f64) {
     if !minimum.is_finite() {
         return (-1.0, 1.0);
     }
-    if (maximum - minimum).abs() < 1e-12 {
+    if maximum == minimum {
         let padding = if minimum.abs() < 1e-12 {
             1.0
         } else {
             minimum.abs() * 0.1
         };
-        (minimum - padding, maximum + padding)
+        let low = minimum - padding;
+        let high = maximum + padding;
+        if low.is_finite() && high.is_finite() && low < high {
+            return (low, high);
+        }
+        // Avoid overflow when a flat curve is close to f64::MAX. There is no
+        // finite value above f64::MAX, so keep the curve on the upper edge.
+        let padding = minimum.abs() * 0.5;
+        if minimum > 0.0 {
+            return (minimum - padding, minimum);
+        }
+        return (minimum, minimum + padding);
+    }
+    (minimum, maximum)
+}
+
+/// Map a value to a zero-to-one coordinate without overflowing on wide ranges.
+///
+/// Invalid or collapsed bounds fall back to the midpoint. Finite inputs outside
+/// the bounds are deliberately not clamped so callers can clip the resulting
+/// line geometry.
+#[must_use]
+pub fn normalized(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if !value.is_finite() || !minimum.is_finite() || !maximum.is_finite() || minimum >= maximum {
+        return 0.5;
+    }
+    let span = maximum - minimum;
+    let numerator = value - minimum;
+    if span.is_finite() && numerator.is_finite() {
+        numerator / span
     } else {
-        (minimum, maximum)
+        (value * 0.5 - minimum * 0.5) / (maximum * 0.5 - minimum * 0.5)
+    }
+}
+
+/// Generate human-friendly tick values inside an inclusive axis range.
+///
+/// At most 100 ticks are returned. Degenerate or non-finite ranges have no
+/// ticks, allowing callers to keep the last valid view instead of drawing
+/// misleading coordinates.
+#[must_use]
+pub fn axis_ticks(minimum: f64, maximum: f64, target_count: usize) -> Vec<f64> {
+    if !minimum.is_finite() || !maximum.is_finite() || minimum >= maximum {
+        return Vec::new();
+    }
+    let target_count = target_count.clamp(2, 100);
+    let raw_step = (maximum - minimum) / (target_count - 1) as f64;
+    if !raw_step.is_finite() || raw_step <= 0.0 {
+        return vec![minimum, maximum];
+    }
+    let magnitude = 10_f64.powf(raw_step.log10().floor());
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return vec![minimum, maximum];
+    }
+    let fraction = raw_step / magnitude;
+    let nice = if fraction <= 1.0 {
+        1.0
+    } else if fraction <= 2.0 {
+        2.0
+    } else if fraction <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let step = nice * magnitude;
+    if !step.is_finite() || step <= 0.0 {
+        return vec![minimum, maximum];
+    }
+    let first = (minimum / step).ceil() * step;
+    let mut ticks = Vec::new();
+    let mut value = first;
+    while value <= maximum && ticks.len() < 100 {
+        ticks.push(value);
+        value += step;
+    }
+    if ticks.is_empty() {
+        vec![minimum, maximum]
+    } else {
+        ticks
     }
 }
 
@@ -183,5 +268,42 @@ mod tests {
         };
         assert!(sample("x", &[], invalid).is_err());
         assert!(sample("x+", &[], PlotOptions::default()).is_err());
+        let excessive = PlotOptions {
+            samples: 100_001,
+            ..PlotOptions::default()
+        };
+        assert!(sample("x", &[], excessive).is_err());
+    }
+
+    #[test]
+    fn sampling_wide_finite_intervals_does_not_overflow() {
+        let options = PlotOptions {
+            x_min: -1e308,
+            x_max: 1e308,
+            samples: 3,
+        };
+        let points = sample("x", &[], options).unwrap();
+        assert_eq!(points[0].x, -1e308);
+        assert_eq!(points[1].x, 0.0);
+        assert_eq!(points[2].x, 1e308);
+        assert!((normalized(0.0, -1e308, 1e308) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn flat_extreme_curves_get_finite_padded_bounds() {
+        let (low, high) = y_bounds(&[Sample {
+            x: 0.0,
+            y: f64::MAX,
+        }]);
+        assert!(low.is_finite() && high.is_finite() && low < f64::MAX);
+        assert!(high > f64::MAX * 0.9);
+    }
+
+    #[test]
+    fn axis_ticks_use_readable_steps_and_reject_bad_ranges() {
+        assert_eq!(axis_ticks(0.0, 1.0, 5), vec![0.0, 0.5, 1.0]);
+        assert_eq!(axis_ticks(-1.0, 1.0, 5), vec![-1.0, -0.5, 0.0, 0.5, 1.0]);
+        assert!(axis_ticks(1.0, 0.0, 5).is_empty());
+        assert_eq!(axis_ticks(-1e308, 1e308, 5), vec![-1e308, 1e308]);
     }
 }
